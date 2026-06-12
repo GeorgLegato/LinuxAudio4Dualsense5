@@ -102,6 +102,34 @@ reverse_engineered/     the tools that cracked the BT protocol (see its README)
 - ✅ Microphone muted, indicator LED quiet, no input-event interference
 - ⚠️ A short start-up transient (speaker amp power-on pop) may remain
 
+## Tested with
+
+| Component | Version |
+|-----------|---------|
+| OS | Ubuntu 24.04.4 LTS (Noble) |
+| Kernel | 6.8.0-124-generic |
+| Audio | PipeWire 1.0.5 |
+| Controller | Sony **DualSense** Wireless Controller, USB ID **`054C:0CE6`** (original model, CFI-ZCT1 series), firmware `0x0110002a` |
+| Link | standard Bluetooth adapter (BR/EDR) |
+
+Other distros and kernels should work too — the only hard requirements are
+PipeWire and `/dev/hidraw` access — but they are untested. Reports welcome.
+
+## Scope — what this does *not* support
+
+This targets the **PS5 DualSense** specifically. It will **not** work with:
+
+- **DualSense Edge** (USB ID `054C:0DF2`) — different product ID; probably needs
+  small tweaks, but untested.
+- **DualShock 4** (PS4 controller) — an entirely different device and audio
+  protocol. Not supported.
+- **Third-party / clone controllers** — these do not implement Sony's audio HID
+  reports at all, so there is nothing to talk to.
+
+The protocol details (report `0x36`, Opus parameters, timing) are specific to
+the DualSense firmware; a very different firmware revision *could* in principle
+behave differently, though none is known to.
+
 ## How this was built (and credits)
 
 This project happened in two phases:
