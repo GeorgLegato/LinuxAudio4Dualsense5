@@ -22,4 +22,21 @@ install: $(TARGET)
 	install -Dm755 $(TARGET) $(HOME)/.local/bin/$(TARGET)
 	@echo "Installiert nach ~/.local/bin/$(TARGET)"
 
-.PHONY: clean install
+# Als systemd-User-Service einrichten: startet beim Login, wartet auf den
+# Controller, erscheint automatisch als "DualSense BT Speaker".
+SERVICE_DIR = $(HOME)/.config/systemd/user
+service: install
+	install -Dm644 ds5-membrane-sink.service $(SERVICE_DIR)/ds5-membrane-sink.service
+	systemctl --user daemon-reload
+	systemctl --user enable --now ds5-membrane-sink.service
+	@echo ""
+	@echo "Service laeuft. Status:  systemctl --user status ds5-membrane-sink"
+	@echo "Stoppen/aus:             systemctl --user disable --now ds5-membrane-sink"
+
+service-uninstall:
+	-systemctl --user disable --now ds5-membrane-sink.service
+	rm -f $(SERVICE_DIR)/ds5-membrane-sink.service
+	systemctl --user daemon-reload
+	@echo "Service entfernt."
+
+.PHONY: clean install service service-uninstall

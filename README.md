@@ -46,6 +46,27 @@ Pair your DualSense over Bluetooth first (it appears as a gamepad). Then a new
 output device **"DualSense BT Speaker"** shows up in your sound settings — select
 it and play anything. Volume works through the normal slider.
 
+### Install as a background service (auto-start)
+
+For a "just works" setup — the sink appears automatically whenever the
+controller connects, with no terminal:
+
+```bash
+cd src
+make service          # builds, installs to ~/.local/bin, enables a systemd user service
+```
+
+The service waits for the DualSense to connect over Bluetooth, brings up the
+sink, and restarts itself if the controller drops. Manage it with:
+
+```bash
+systemctl --user status  ds5-membrane-sink
+systemctl --user restart ds5-membrane-sink
+make service-uninstall    # remove it
+```
+
+No root required — it runs in your normal user session (the GNOME/systemd way).
+
 ## Repository layout
 
 ```

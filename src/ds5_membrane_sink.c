@@ -60,6 +60,7 @@ struct data {
 
     float acc[INPUT_BLOCK * CHANNELS];   // Akkumulator fuer 512-Frame-Bloecke
     int acc_frames;
+    int write_errors;                    // -> Controller weg -> Loop beenden
 };
 
 // --- 0x36-Paket bauen + senden ------------------------------------------------
@@ -104,7 +105,12 @@ static void send_block(struct data *d, const float *block512) {
     uint32_t crc = ds_crc(pkt, REPORT_SIZE - 4);
     pkt[394]=crc&0xFF; pkt[395]=(crc>>8)&0xFF; pkt[396]=(crc>>16)&0xFF; pkt[397]=(crc>>24)&0xFF;
 
-    if (write(d->hidraw_fd, pkt, REPORT_SIZE) < 0) { /* ignore transient */ }
+    if (write(d->hidraw_fd, pkt, REPORT_SIZE) < 0) {
+        // Controller weg -> nach ~0.5s aufgeben, systemd startet uns neu.
+        if (++d->write_errors > 50) pw_main_loop_quit(d->loop);
+    } else {
+        d->write_errors = 0;
+    }
     d->seq = (d->seq + 1) & 0x0F;
     d->counter = (d->counter + 1) & 0xFF;
 }
@@ -180,9 +186,18 @@ int main(int argc, char **argv) {
     pw_init(&argc, &argv);
     struct data d; memset(&d, 0, sizeof(d));
 
+    // --wait: warte auf den Controller statt sofort zu beenden (fuer den
+    // systemd-Service, der dauerhaft laeuft und auf BT-Connect reagiert).
+    int opt_wait = 0;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--wait") == 0) opt_wait = 1;
+
     char hidraw[64];
-    if (find_hidraw(hidraw, sizeof(hidraw)) < 0) {
-        fprintf(stderr, "DualSense BT hidraw nicht gefunden.\n"); return 1;
+    while (find_hidraw(hidraw, sizeof(hidraw)) < 0) {
+        if (!opt_wait) {
+            fprintf(stderr, "DualSense BT hidraw nicht gefunden.\n"); return 1;
+        }
+        sleep(2);   // warten bis der Controller per BT verbindet
     }
     d.hidraw_fd = open(hidraw, O_WRONLY);
     if (d.hidraw_fd < 0) { perror("open hidraw"); return 1; }

@@ -1,0 +1,14 @@
+[Unit]
+Description=DualSense BT Speaker (PipeWire sink)
+Documentation=https://github.com/GeorgLegato/ps5-bt-audio
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+# --wait: bleibt am Leben und wartet, bis der DualSense per BT verbindet.
+ExecStart=%h/.local/bin/ds5_membrane_sink --wait
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
