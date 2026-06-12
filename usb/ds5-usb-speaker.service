@@ -1,0 +1,14 @@
+[Unit]
+Description=DualSense USB Speaker (4ch audio card + HID enable)
+Documentation=https://github.com/GeorgLegato/LinuxAudio4Dualsense5
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+ExecStart=%h/.local/share/ds5-usb-speaker/ds5-usb-speaker.sh start
+ExecStop=%h/.local/share/ds5-usb-speaker/ds5-usb-speaker.sh stop
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

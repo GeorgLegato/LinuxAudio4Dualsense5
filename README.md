@@ -65,13 +65,29 @@ make
 ./ds5_membrane_sink        # Ctrl+C to stop
 ```
 
+### Wired? Use the USB variant
+
+If you have no Bluetooth or prefer a cable, there's a USB path too — over USB
+the DualSense is a normal 4-channel audio card, it just needs routing + a
+speaker-enable. See [`usb/`](usb/):
+
+```bash
+pip install --user pydualsense
+cd src && make service-usb
+```
+
 ## Repository layout
 
 ```
-src/                    native PipeWire sink (the real product)
+src/                    native PipeWire sink over BLUETOOTH (the real product)
   ds5_membrane_sink.c   ~250 lines of C: PipeWire node + Opus + 0x36 + CRC
-  Makefile
-reverse_engineered/     the tools that cracked the protocol (see its README)
+  Makefile              make / make service / make service-usb
+  ds5-membrane-sink.service
+usb/                    wired variant (4ch USB-audio card + HID enable)
+  ds5-usb-speaker.sh    routing + speaker-enable wrapper
+  ds5-usb-setup.sh      PipeWire FL/FR routing
+  ds5_usb_enable.py     HID speaker-enable keep-alive (needs pydualsense)
+reverse_engineered/     the tools that cracked the BT protocol (see its README)
   ps5bt_membrane.py     Python reference implementation of the speaker path
   ps5bt_speaker.py      the earlier haptics-path experiments
   tune.py               interactive curses tuner used during RE
@@ -86,19 +102,32 @@ reverse_engineered/     the tools that cracked the protocol (see its README)
 - ✅ Microphone muted, indicator LED quiet, no input-event interference
 - ⚠️ A short start-up transient (speaker amp power-on pop) may remain
 
-## Credits
+## How this was built (and credits)
 
-This work stands entirely on two open-source projects that reverse-engineered
-the DualSense Bluetooth audio path first:
+This project happened in two phases:
 
-- **[DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge)** (AGPL-3.0) — the
-  Raspberry Pi Pico bridge whose `audio.cpp`/`bt.cpp` revealed the `0x36` report
-  format, the Opus CBR parameters, the 512/480 timing and the speaker-enable
-  sequence. This project is a native-Linux reimplementation of that protocol
-  knowledge.
-- **[SAxense](https://github.com/egormanga/SAxense)** (MPL-2.0) — the original
-  proof that DualSense haptics audio can be driven over Bluetooth from
-  `/dev/hidraw`, and the source of the report-container layout and CRC seed.
+1. **Trial and error.** Starting from the insight in
+   **[SAxense](https://github.com/egormanga/SAxense)** (MPL-2.0) — that DualSense
+   *haptics* audio can be driven over Bluetooth by writing straight to
+   `/dev/hidraw` — we got the first crackly sounds out of the controller and
+   learned the report-container layout and the CRC-32 seed `0xA2`. An
+   interactive tuner (`reverse_engineered/tune.py`) was used to probe every
+   unknown field by ear; `btmon` verified each hypothesis on the wire.
+
+2. **Reusing the Pico project for the fine audio details.** The *speaker*
+   (membrane) path — Opus encoding, report `0x36`, the CBR parameters, and the
+   crucial **512→480 / 10.667 ms** timing that finally killed the periodic
+   stutter — was reverse-engineered from
+   **[DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge)** (AGPL-3.0-only),
+   a **Raspberry Pi Pico 2 W** bridge whose `audio.cpp`/`bt.cpp` document the
+   protocol precisely. This project is a native-Linux reimplementation of that
+   knowledge — **no Pico, no extra hardware**, just the Bluetooth adapter you
+   already have.
+
+DS5_Bridge is itself derived from
+**[awalol/DS5Dongle](https://github.com/awalol/DS5Dongle)** (MIT), the original
+Pico DualSense dongle. Full chain: DS5Dongle (MIT) → DS5_Bridge (AGPL-3.0) →
+this project (AGPL-3.0). Huge thanks to all of them — this stands on their work.
 
 ## License
 
