@@ -33,39 +33,37 @@ the obvious 10 ms is 6.67 % too fast and overruns the controller's audio buffer,
 producing a periodic ~0.5 s stutter. Resampling 512→480 and pacing at
 512/48000 s matches the controller's audio clock exactly.
 
-## Quick start (native PipeWire sink — recommended)
+## Quick start
 
 ```bash
 sudo apt install libpipewire-0.3-dev libopus-dev zlib1g-dev gcc make
 cd src
-make
-./ds5_membrane_sink
+make service
 ```
 
-Pair your DualSense over Bluetooth first (it appears as a gamepad). Then a new
-output device **"DualSense BT Speaker"** shows up in your sound settings — select
-it and play anything. Volume works through the normal slider.
+That's it. `make service` builds the sink, installs it to `~/.local/bin`, and
+enables a **systemd user service** that auto-starts. Pair your DualSense over
+Bluetooth (it appears as a gamepad) and **"DualSense BT Speaker"** shows up in
+your sound settings — select it and play anything. Volume works through the
+normal slider.
 
-### Install as a background service (auto-start)
+The service waits for the controller to connect, brings up the sink
+automatically, and restarts itself if the controller drops. It runs in your
+normal user session — **no root, no terminal kept open** (the GNOME/systemd way).
 
-For a "just works" setup — the sink appears automatically whenever the
-controller connects, with no terminal:
+```bash
+systemctl --user status  ds5-membrane-sink   # is it running?
+systemctl --user restart ds5-membrane-sink
+make service-uninstall                        # remove it
+```
+
+### Run manually instead (for testing)
 
 ```bash
 cd src
-make service          # builds, installs to ~/.local/bin, enables a systemd user service
+make
+./ds5_membrane_sink        # Ctrl+C to stop
 ```
-
-The service waits for the DualSense to connect over Bluetooth, brings up the
-sink, and restarts itself if the controller drops. Manage it with:
-
-```bash
-systemctl --user status  ds5-membrane-sink
-systemctl --user restart ds5-membrane-sink
-make service-uninstall    # remove it
-```
-
-No root required — it runs in your normal user session (the GNOME/systemd way).
 
 ## Repository layout
 
