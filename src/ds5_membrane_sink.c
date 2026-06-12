@@ -164,10 +164,12 @@ static int find_hidraw(char *out, size_t outlen) {
             if (strstr(line, "HID_ID=0005:0000054C:00000CE6")) { hit = 1; break; }
         fclose(f);
         if (hit) {
-            char node[64];
-            sscanf(g.gl_pathv[i], "/sys/class/hidraw/%63[^/]", node);
-            snprintf(out, outlen, "/dev/%s", node);
-            found = 0; break;
+            char node[32];
+            if (sscanf(g.gl_pathv[i], "/sys/class/hidraw/%31[^/]", node) == 1) {
+                snprintf(out, outlen, "/dev/%s", node);
+                found = 0;
+            }
+            break;
         }
     }
     globfree(&g);
