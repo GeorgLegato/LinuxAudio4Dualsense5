@@ -1,6 +1,6 @@
 [Unit]
 Description=DualSense BT Speaker (PipeWire sink)
-Documentation=https://github.com/GeorgLegato/ps5-bt-audio
+Documentation=https://github.com/GeorgLegato/LinuxAudio4Dualsense5
 After=pipewire.service wireplumber.service
 Wants=pipewire.service
 
