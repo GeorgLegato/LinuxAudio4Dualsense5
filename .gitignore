@@ -1,0 +1,16 @@
+# Build artifacts
+src/ds5_membrane_sink
+*.o
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs / captures from RE sessions
+*.log
+*.snoop
+btmon*.txt
+
+# Editor
+*.swp
+.vscode/
