@@ -26,12 +26,32 @@ make it work — none of them documented by Sony:
 | Frame timing | **512 input samples → resampled to 480 → sent every 10.667 ms** (512/48000), *not* 10 ms |
 | Checksum | CRC-32 with seed `0xA2` over the first 394 bytes |
 | Speaker enable | report `0x31`: `audio_control = 0x30` (speaker path), preamp `0x02` |
-| Microphone | muted in the state snapshot, or the controller floods the BT link with a return stream |
+| Config mask | `0x11` byte 4 = **`0xFE`** — bit 0 *cleared*. See "Audio + gamepad" below. |
 
-The single most important detail is the **10.667 ms frame interval**: sending at
-the obvious 10 ms is 6.67 % too fast and overruns the controller's audio buffer,
-producing a periodic ~0.5 s stutter. Resampling 512→480 and pacing at
-512/48000 s matches the controller's audio clock exactly.
+Two details matter most:
+
+- **The 10.667 ms frame interval.** Sending at the obvious 10 ms is 6.67 % too
+  fast and overruns the controller's audio buffer → periodic ~0.5 s stutter.
+  Resampling 512→480 and pacing at 512/48000 s matches the controller's audio
+  clock exactly.
+- **The config mask `0xFE`, not `0xFF`.** Bit 0 of the audio-section mask turns
+  on the controller's **microphone-capture / duplex mode**. With it set, the
+  DualSense streams mic audio *back* under the **same HID report id (`0x31`) as
+  gamepad input** — which the kernel and Steam misread as full stick deflection
+  (phantom input: the avatar runs by itself while audio plays). We only want the
+  speaker, so we **clear bit 0** → no mic capture → the input stream stays clean.
+
+## Audio + gamepad at the same time ✔
+
+Because of the `0xFE` mask above, **you can use the controller as a gamepad
+*and* hear game audio through it simultaneously over Bluetooth** — no cable, no
+filter, no Steam workaround. The controller no longer mixes audio into its input
+reports, so Steam Input / the kernel / any mapper see a perfectly normal gamepad.
+
+> If a controller is *already* stuck in duplex from an older session (or another
+> app enabled the mic), reconnect it once (PS button) to clear it. The optional
+> `mapper/ds5_keymap.py` (stick→WASD straight from hidraw, dropping any stray
+> `0xd4` audio frames) is kept as a safety net for that case.
 
 ## Quick start
 
@@ -87,10 +107,14 @@ usb/                    wired variant (4ch USB-audio card + HID enable)
   ds5-usb-speaker.sh    routing + speaker-enable wrapper
   ds5-usb-setup.sh      PipeWire FL/FR routing
   ds5_usb_enable.py     HID speaker-enable keep-alive (needs pydualsense)
+mapper/                 optional Steam-free gamepad mapper
+  ds5_keymap.py         stick -> WASD straight from hidraw, drops 0xd4 frames
 reverse_engineered/     the tools that cracked the BT protocol (see its README)
   ps5bt_membrane.py     Python reference implementation of the speaker path
   ps5bt_speaker.py      the earlier haptics-path experiments
   tune.py               interactive curses tuner used during RE
+  init_probe.py         TUI that found the mask bit-0 mic-capture switch
+  check_input.py        shows gamepad vs d4-feedback rate from hidraw
   run.sh                test harness (tones, sweeps, diagnostics)
   membrane-sink.sh      null-sink + parec workaround (pre-native-node)
 ```
