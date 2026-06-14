@@ -94,7 +94,10 @@ static void send_block(struct data *d, const float *block512) {
     memset(pkt, 0, sizeof(pkt));
     pkt[0] = 0x36;
     pkt[1] = (d->seq & 0x0F) << 4;
-    pkt[2] = 0x11 | 0x80;  pkt[3] = 7;  pkt[4] = 0xFF;
+    // 0x11 config: mask 0xFE (Bit0 clear = KEIN Mic-Capture/Duplex -> kein d4-
+    // Stream im Input-Channel). DS5_Bridge nutzt 0xFF (Bit0=1) fuer Voice-Chat-
+    // Duplex; wir wollen nur Speaker -> Bit0 raus. Verifiziert mit init_probe.py.
+    pkt[2] = 0x11 | 0x80;  pkt[3] = 7;  pkt[4] = 0xFE;
     pkt[5]=pkt[6]=pkt[7]=pkt[8]=pkt[9] = 64;
     pkt[10] = d->counter;
     pkt[11] = 0x10 | 0x80; pkt[12] = STATE_SNAP_SIZE;

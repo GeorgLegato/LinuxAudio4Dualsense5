@@ -238,7 +238,7 @@ def build_speaker_setup() -> bytes:
 
 REPORT_36_SIZE = 398
 SAMPLE_SIZE = 64
-AUDIO_SECTION_ENABLE_MASK = 0xFF
+AUDIO_SECTION_ENABLE_MASK = 0xFE   # Bit0 clear = kein Mic-Capture/Duplex (kein d4)
 HAPTICS_BUFFER_LENGTH = 64
 SPEAKER_DATA_SIZE = 200      # pkt[143] = 200 (sizeof opus_buf)
 STATE_SNAPSHOT_SIZE = 63
