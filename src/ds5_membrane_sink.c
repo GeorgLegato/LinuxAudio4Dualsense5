@@ -62,6 +62,7 @@
 #define MIC_TOC          0xD4       // konstanter Opus-TOC der Mic-Frames (= "Marker")
 #define MIC_VOL          0x40       // mic_volume im State-Snapshot wenn Mic an
 #define MIC_RING_FRAMES  48000      // 1 s Mono-Ringpuffer (decoded PCM)
+#define MIC_PREBUF       4800       // ~100 ms Jitter-Polster bevor die Source spielt
 
 // --- "Rumble as Subwoofer": Bass an die Haptik-Aktuatoren ---------------------
 // Die Membran hat keinen Tiefbass; die zwei Voice-Coil-Haptik-Aktuatoren sind
@@ -128,6 +129,7 @@ struct data {
     pthread_mutex_t mic_lock;
     float mic_ring[MIC_RING_FRAMES];
     int   mic_w, mic_r;               // Schreib-/Lese-Index (mono float)
+    int   mic_ready;                  // 0 = Prebuffer (warte auf Polster), 1 = spielt
 };
 
 // RBJ-Tiefpass-Biquad (Q=0.707, Butterworth) — Koeffizienten setzen.
@@ -850,14 +852,21 @@ static void on_process_src(void *userdata) {
     struct spa_buffer *buf = b->buffer;
     float *dst = buf->datas[0].data;
     if (dst) {
-        uint32_t req = buf->datas[0].maxsize / sizeof(float);
-        if (b->requested && b->requested < req) req = b->requested;
+        uint32_t maxf = buf->datas[0].maxsize / sizeof(float);
+        // Quantum: was der Graph anfordert; Fallback 512 (Source node.latency).
+        uint32_t req = (b->requested && (uint32_t)b->requested <= maxf)
+                       ? (uint32_t)b->requested : (maxf < 512 ? maxf : 512);
         pthread_mutex_lock(&d->mic_lock);
-        for (uint32_t i = 0; i < req; i++) {
-            if (d->mic_r != d->mic_w) {
+        uint32_t avail = (uint32_t)((d->mic_w - d->mic_r + MIC_RING_FRAMES) % MIC_RING_FRAMES);
+        if (!d->mic_ready && avail >= MIC_PREBUF) d->mic_ready = 1;  // Polster voll -> los
+        for (uint32_t i = 0; i < req; i++) {            // IMMER volle req Frames liefern
+            if (d->mic_ready && d->mic_r != d->mic_w) {
                 dst[i] = d->mic_ring[d->mic_r];
                 d->mic_r = (d->mic_r + 1) % MIC_RING_FRAMES;
-            } else dst[i] = 0.f;                     // Underrun / Mic aus -> Stille
+            } else {
+                dst[i] = 0.f;                           // Prebuffer / echter Underrun
+                d->mic_ready = 0;                       // -> Polster neu aufbauen
+            }
         }
         pthread_mutex_unlock(&d->mic_lock);
         buf->datas[0].chunk->offset = 0;
@@ -966,6 +975,7 @@ int main(int argc, char **argv) {
             PW_KEY_MEDIA_CLASS, "Audio/Source",
             PW_KEY_NODE_NAME, "ds5_mic",
             PW_KEY_NODE_DESCRIPTION, "DualSense BT Mic",
+            PW_KEY_NODE_LATENCY, "512/48000",   // festes Quantum -> req planbar
             NULL),
         &src_stream_events, &d);
     uint8_t sbuf[1024];
