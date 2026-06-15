@@ -34,7 +34,9 @@
 
 #define SRC_RATE        48000
 #define CHANNELS        2          // Opus an den Controller: stereo (DS5_Bridge)
-#define SINK_CH         1          // PipeWire-Sink: MONO (Membran ist 1 Lautsprecher)
+#define SINK_CH         2          // PipeWire-Sink: 2 Kanaele = FL Membran / FR Haptik
+#define CH_MEMBRANE     0          // FL -> Membran-Speaker
+#define CH_HAPTIC       1          // FR -> Haptik (Subwoofer-Kette)
 #define INPUT_BLOCK     512        // Frames pro Sende-Block (DS5_Bridge)
 #define OPUS_FRAME      480        // Opus-Frame nach Resampling
 #define OPUS_BITRATE    (200*8*100) // 160 kbps CBR -> exakt 200 byte/frame
@@ -99,7 +101,7 @@ struct data {
     int fade_pos;
     int preroll_done;
 
-    float acc[INPUT_BLOCK];              // Akkumulator (MONO) fuer 512-Frame-Bloecke
+    float acc[INPUT_BLOCK * SINK_CH];    // Akkumulator: [FL Membran, FR Haptik]
     int acc_frames;
     int write_errors;                    // -> Controller weg -> Loop beenden
 
@@ -228,7 +230,7 @@ static void build_haptic(struct data *d, const float *block512, uint8_t *hap) {
         float last = 0.f;
         for (int j = 0; j < HAPTIC_DECIM; j++) {
             int fr = i * HAPTIC_DECIM + j;
-            float mono = block512[fr];              // Sink ist mono
+            float mono = block512[fr*SINK_CH + CH_HAPTIC];   // FR -> Haptik-Kanal
             float y = d->bq_b0*mono + d->bq_b1*d->bq_x1 + d->bq_b2*d->bq_x2
                       - d->bq_a1*d->bq_y1 - d->bq_a2*d->bq_y2;
             d->bq_x2 = d->bq_x1; d->bq_x1 = mono;
@@ -310,7 +312,7 @@ static void analyser_compute(struct data *d, const float *block512,
     static float re[FFT_N], im[FFT_N];
     double msum = 0.0;
     for (int i = 0; i < FFT_N; i++) {
-        float mono = block512[i];               // Sink ist mono
+        float mono = block512[i*SINK_CH + CH_MEMBRANE];   // Spektrum vom Membran-Kanal
         msum += (double)mono * mono;
         re[i] = mono * g_hann[i];
         im[i] = 0.f;
@@ -365,13 +367,14 @@ static void send_block(struct data *d, const float *block512) {
         int idx = (int)src;
         int nxt = idx < INPUT_BLOCK - 1 ? idx + 1 : idx;
         float frac = (float)(src - idx);
-        float a = block512[idx], b = block512[nxt];      // Mono-Input
+        float a = block512[idx*SINK_CH + CH_MEMBRANE];   // FL -> Membran
+        float b = block512[nxt*SINK_CH + CH_MEMBRANE];
         float v = a + (b - a) * frac;
         if (d->fade_pos < FADE_SAMPLES) {
             int s = d->fade_pos + i;
             if (s < FADE_SAMPLES) v *= (float)s / FADE_SAMPLES;
         }
-        out[i*CHANNELS] = out[i*CHANNELS+1] = v;         // Mono -> L=R
+        out[i*CHANNELS] = out[i*CHANNELS+1] = v;         // Mono-Membran -> Opus L=R
     }
     if (d->fade_pos < FADE_SAMPLES) d->fade_pos += OPUS_FRAME;
 
@@ -443,7 +446,8 @@ static void on_process(void *userdata) {
         uint32_t n_bytes = buf->datas[0].chunk->size;
         uint32_t n_frames = n_bytes / (sizeof(float) * SINK_CH);
         for (uint32_t f = 0; f < n_frames; f++) {
-            d->acc[d->acc_frames] = samples[f];   // mono
+            d->acc[d->acc_frames*SINK_CH + CH_MEMBRANE] = samples[f*SINK_CH + CH_MEMBRANE];
+            d->acc[d->acc_frames*SINK_CH + CH_HAPTIC]   = samples[f*SINK_CH + CH_HAPTIC];
             if (++d->acc_frames >= INPUT_BLOCK) {
                 send_block(d, d->acc);
                 d->acc_frames = 0;
@@ -939,8 +943,8 @@ int main(int argc, char **argv) {
     struct spa_audio_info_raw info = {
         .format = SPA_AUDIO_FORMAT_F32,
         .rate = SRC_RATE,
-        .channels = SINK_CH,                 // mono -> GNOME zeigt testbaren Lautsprecher
-        .position = { SPA_AUDIO_CHANNEL_MONO },
+        .channels = SINK_CH,                 // FL = Membran, FR = Haptik
+        .position = { SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR },
     };
     const struct spa_pod *params[1];
     params[0] = spa_format_audio_raw_build(&bld, SPA_PARAM_EnumFormat, &info);

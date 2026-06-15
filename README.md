@@ -34,7 +34,8 @@ make it work — none of them documented by Sony:
 | Piece | Value |
 |-------|-------|
 | HID output report | `0x36` (398 bytes), four sub-packets: config `0x11`, state `0x10`, haptics `0x12`, **speaker `0x13`** |
-| Audio codec | **Opus, 48 kHz stereo, CBR 160 kbps** → exactly 200 bytes/frame (the PipeWire sink itself is presented as **mono** — the membrane is a single speaker — and duplicated to L/R for the Opus the controller expects) |
+| Audio codec | **Opus, 48 kHz stereo, CBR 160 kbps** → exactly 200 bytes/frame |
+| Sink channels | **stereo: front-left = membrane speaker, front-right = haptic** (see "Two outputs" below). The membrane channel is duplicated to L/R for the Opus the controller expects. |
 | Frame timing | **512 input samples → resampled to 480 → sent every 10.667 ms** (512/48000), *not* 10 ms |
 | Checksum | CRC-32 with seed `0xA2` over the first 394 bytes |
 | Speaker enable | report `0x31`: `audio_control = 0x30` (speaker path), preamp `0x02` |
@@ -83,6 +84,21 @@ The haptic route is `0x12`: 64 × int8 PCM at 6 kHz, exactly one frame per
 
 > Note: the actuators have a slow impulse response, so this adds *weight and
 > pressure*, not a snappy transient — a sub, not a tweeter.
+
+**Two outputs (stereo channel map).** The sink is presented to the OS as a
+**stereo** device whose two channels are *not* left/right music but two physical
+outputs:
+
+- **front-left → the membrane speaker** (full range)
+- **front-right → the haptic actuators** (run through the low-pass / gain / amp
+  above; cutoff stays in the web UI)
+
+This makes GNOME show **two testable speakers** ("Front Left" = membrane, "Front
+Right" = haptic) and a balance slider. It also means **a normal stereo source
+plays its left channel on the membrane and feeds its right channel to the
+haptics** — for plain music listening, output mono (or know that the right
+channel drives the rumble). Apps that want a dedicated rumble channel can send
+bass straight to the right channel.
 
 ### Configure it — `~/.DS5/config`
 
