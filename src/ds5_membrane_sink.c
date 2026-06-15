@@ -22,6 +22,15 @@
 #include <stdint.h>
 #include <glob.h>
 #include <zlib.h>
+#include <math.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <errno.h>
 
 #define SRC_RATE        48000
 #define CHANNELS        2
@@ -33,6 +42,29 @@
 #define STATE_SNAP_SIZE 63
 #define FADE_SAMPLES    1920
 #define PREROLL_PKTS    24
+#define HAPTIC_N        64         // 0x12 sub-packet: 64 int8 samples @ 6 kHz
+#define HAPTIC_DECIM    (INPUT_BLOCK / HAPTIC_N)  // 512/64 = 8  (48k -> 6k)
+#define SUB_PI          3.14159265358979323846
+#define CFG_CHECK_PKTS  96         // ~1s: Config-Datei auf Aenderung pruefen
+
+// --- Web/API + Analyser -------------------------------------------------------
+#define WEB_PORT_DEFAULT 8118
+#define WEB_MAX_CLIENTS  8
+#define FFT_N            512        // = INPUT_BLOCK (eine FFT pro Block)
+#define NBANDS           28         // Spektrum-Baender fuer die Analyser-Anzeige
+
+// --- "Rumble as Subwoofer": Bass an die Haptik-Aktuatoren ---------------------
+// Die Membran hat keinen Tiefbass; die zwei Voice-Coil-Haptik-Aktuatoren sind
+// quasi Koerperschall-Subwoofer. Wir spiegeln einen tiefpassgefilterten Mono-
+// Bass auf die Haptik-Route (0x12). Parameter aus ~/.DS5/config, live nachladbar.
+struct subcfg {
+    int   enabled;     // default 1 (an)
+    float cutoff;      // Tiefpass-Cutoff Hz, default 200
+    float gain;        // Haptik-Gain, default 2.6
+    int   amp;         // int8-Amplituden-Cap (<=127), default 64
+    int   web;         // Web/API-Dienst an? default 1
+    int   web_port;    // default 8118
+};
 
 // --- DualSense 0x31/0x36 Konstanten (aus DS5_Bridge bt.cpp/audio.cpp) ----------
 static const uint8_t STATE_SNAPSHOT[STATE_SNAP_SIZE] = {
@@ -61,10 +93,244 @@ struct data {
     float acc[INPUT_BLOCK * CHANNELS];   // Akkumulator fuer 512-Frame-Bloecke
     int acc_frames;
     int write_errors;                    // -> Controller weg -> Loop beenden
+
+    // Subwoofer (Haptik-Bass)
+    struct subcfg cfg;
+    float bq_b0, bq_b1, bq_b2, bq_a1, bq_a2;   // Biquad-LP-Koeffizienten
+    float bq_x1, bq_x2, bq_y1, bq_y2;          // Biquad-Zustand
+    float dc_x1, dc_y1;                        // One-Pole DC-Blocker-Zustand
+    char  cfg_path[256];
+    time_t cfg_mtime;
+    int   cfg_ctr;
+
+    // Web/API + Analyser (gemeinsamer Zustand, durch lock geschuetzt)
+    pthread_mutex_t lock;
+    int   cfg_apply;                  // Web aenderte cutoff -> Audio-Thread neu rechnen
+    volatile int web_clients;         // >0 -> Analyser (FFT) ueberhaupt rechnen
+    int   ana_bands[NBANDS];          // 0..100 pro Band (Spektrum-Snapshot)
+    int   ana_mem, ana_hap;           // 0..100 Pegel Membran / Haptik
 };
+
+// RBJ-Tiefpass-Biquad (Q=0.707, Butterworth) — Koeffizienten setzen.
+static void sub_set_cutoff(struct data *d, float fc) {
+    if (fc < 20.f) fc = 20.f;
+    if (fc > SRC_RATE / 2 - 100) fc = SRC_RATE / 2 - 100;
+    double w0 = 2.0 * SUB_PI * fc / SRC_RATE;
+    double cw = cos(w0), sw = sin(w0);
+    double alpha = sw / (2.0 * 0.7071);
+    double b0 = (1 - cw) / 2, b1 = 1 - cw, b2 = (1 - cw) / 2;
+    double a0 = 1 + alpha, a1 = -2 * cw, a2 = 1 - alpha;
+    d->bq_b0 = b0 / a0; d->bq_b1 = b1 / a0; d->bq_b2 = b2 / a0;
+    d->bq_a1 = a1 / a0; d->bq_a2 = a2 / a0;
+    d->cfg.cutoff = fc;
+}
+
+// ~/.DS5/config lesen (key = value, '#'=Kommentar). Stiller No-op ohne Datei.
+static void load_config(struct data *d) {
+    FILE *f = fopen(d->cfg_path, "r");
+    if (!f) return;
+    char line[256], key[64], val[64];
+    float new_cut = d->cfg.cutoff;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        if (sscanf(line, " %63[a-zA-Z_] = %63s", key, val) == 2 ||
+            sscanf(line, " %63[a-zA-Z_] %63s", key, val) == 2) {
+            if (!strcmp(key, "subwoofer") || !strcmp(key, "enabled"))
+                d->cfg.enabled = (!strcmp(val, "on") || !strcmp(val, "1") ||
+                                  !strcmp(val, "true") || !strcmp(val, "yes"));
+            else if (!strcmp(key, "cutoff_hz") || !strcmp(key, "cutoff"))
+                new_cut = (float)atof(val);
+            else if (!strcmp(key, "gain"))
+                d->cfg.gain = (float)atof(val);
+            else if (!strcmp(key, "amp")) {
+                int a = atoi(val);
+                d->cfg.amp = a < 1 ? 1 : (a > 127 ? 127 : a);
+            }
+            else if (!strcmp(key, "web"))
+                d->cfg.web = (!strcmp(val, "on") || !strcmp(val, "1") ||
+                              !strcmp(val, "true") || !strcmp(val, "yes"));
+            else if (!strcmp(key, "web_port") || !strcmp(key, "port"))
+                d->cfg.web_port = atoi(val);
+        }
+    }
+    fclose(f);
+    if (new_cut != d->cfg.cutoff) sub_set_cutoff(d, new_cut);
+}
+
+// Aktuelle Config zurueck in ~/.DS5/config schreiben (Web-Edit persistieren).
+// Setzt cfg_mtime, damit der mtime-Reload dieselben Werte nicht erneut laedt.
+static void save_config(struct data *d) {
+    FILE *f = fopen(d->cfg_path, "w");
+    if (!f) return;
+    fprintf(f,
+        "# DualSense BT Speaker — Konfiguration (live nachgeladen, ~1x/s).\n"
+        "# Editierbar per Web-UI (http://localhost:%d) oder von Hand.\n"
+        "\n"
+        "# Rumble as Subwoofer: tiefpassgefilterter Bass an die Haptik-Aktuatoren.\n"
+        "subwoofer = %s\n"
+        "cutoff_hz = %.0f\n"
+        "gain      = %.2f\n"
+        "amp       = %d\n"
+        "\n"
+        "# Web/API-Dienst (Analyser + Tweak-UI), nur localhost.\n"
+        "web       = %s\n"
+        "web_port  = %d\n",
+        d->cfg.web_port, d->cfg.enabled ? "on" : "off", d->cfg.cutoff,
+        d->cfg.gain, d->cfg.amp, d->cfg.web ? "on" : "off", d->cfg.web_port);
+    fclose(f);
+    struct stat st;
+    if (stat(d->cfg_path, &st) == 0) d->cfg_mtime = st.st_mtime;
+}
+
+// Default-Config beim ersten Start anlegen, damit der User die Params kennt.
+static void write_default_config(struct data *d) {
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s/.DS5", home);
+    mkdir(dir, 0755);
+    save_config(d);
+}
+
+// Bass-Haptik aus dem 512-Frame-Block: mono -> LP -> DC-Block -> /8 -> 64 int8.
+// Filtert ALLE 512 Samples (Reihenfolge!), behaelt je 8er-Gruppe das letzte.
+static void build_haptic(struct data *d, const float *block512, uint8_t *hap) {
+    if (!d->cfg.enabled) { memset(hap, 0, HAPTIC_N); return; }
+    const int amp = d->cfg.amp;
+    const float gain = d->cfg.gain;
+    for (int i = 0; i < HAPTIC_N; i++) {
+        float last = 0.f;
+        for (int j = 0; j < HAPTIC_DECIM; j++) {
+            int fr = i * HAPTIC_DECIM + j;
+            float mono = 0.5f * (block512[fr*CHANNELS] + block512[fr*CHANNELS+1]);
+            float y = d->bq_b0*mono + d->bq_b1*d->bq_x1 + d->bq_b2*d->bq_x2
+                      - d->bq_a1*d->bq_y1 - d->bq_a2*d->bq_y2;
+            d->bq_x2 = d->bq_x1; d->bq_x1 = mono;
+            d->bq_y2 = d->bq_y1; d->bq_y1 = y;
+            last = y;
+        }
+        float dc = last - d->dc_x1 + 0.995f * d->dc_y1;   // DC-Blocker (~20 Hz HP)
+        d->dc_x1 = last; d->dc_y1 = dc;
+        int v = (int)lrintf(dc * gain * amp);
+        if (v > amp) v = amp; else if (v < -amp) v = -amp;
+        hap[i] = (uint8_t)(v & 0xFF);                     // int8 -> two's-complement byte
+    }
+}
+
+// --- Analyser: 512-Punkt-FFT -> Baender, nur wenn ein Browser verbunden ist ---
+static float g_hann[FFT_N];
+static int   g_band_lo[NBANDS], g_band_hi[NBANDS];   // FFT-Bin-Bereich je Band
+static float g_band_hz[NBANDS];                      // Band-Mittenfrequenz (Anzeige)
+static int   g_ana_init = 0;
+
+static void analyser_init(void) {
+    for (int i = 0; i < FFT_N; i++)
+        g_hann[i] = 0.5f * (1.f - cosf(2.f * (float)SUB_PI * i / (FFT_N - 1)));
+    // Log-verteilte Baender von 40 Hz bis 16 kHz auf FFT-Bins abbilden.
+    double f0 = 40.0, f1 = 16000.0;
+    double binhz = (double)SRC_RATE / FFT_N;          // 93.75 Hz/Bin
+    for (int b = 0; b < NBANDS; b++) {
+        double lo = f0 * pow(f1 / f0, (double)b / NBANDS);
+        double hi = f0 * pow(f1 / f0, (double)(b + 1) / NBANDS);
+        int blo = (int)(lo / binhz), bhi = (int)(hi / binhz);
+        if (blo < 1) blo = 1;
+        if (bhi <= blo) bhi = blo + 1;
+        if (bhi > FFT_N / 2) bhi = FFT_N / 2;
+        g_band_lo[b] = blo; g_band_hi[b] = bhi;
+        g_band_hz[b] = (float)sqrt(lo * hi);          // geometrische Mitte
+    }
+    g_ana_init = 1;
+}
+
+// Iterative Radix-2-FFT (in-place), N = FFT_N. re/im Laenge N.
+static void fft512(float *re, float *im) {
+    int n = FFT_N;
+    for (int i = 1, j = 0; i < n; i++) {              // Bit-Reversal-Permutation
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) { float t;
+            t = re[i]; re[i] = re[j]; re[j] = t;
+            t = im[i]; im[i] = im[j]; im[j] = t; }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        double ang = -2.0 * SUB_PI / len;
+        float wr = (float)cos(ang), wi = (float)sin(ang);
+        for (int i = 0; i < n; i += len) {
+            float cr = 1.f, ci = 0.f;
+            for (int k = 0; k < len / 2; k++) {
+                int a = i + k, b = i + k + len / 2;
+                float xr = re[b] * cr - im[b] * ci;
+                float xi = re[b] * ci + im[b] * cr;
+                re[b] = re[a] - xr; im[b] = im[a] - xi;
+                re[a] += xr;        im[a] += xi;
+                float ncr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr; cr = ncr;
+            }
+        }
+    }
+}
+
+static int db_to_level(float lin, float floor_db) {  // lin>0 -> 0..100
+    float db = 20.f * log10f(lin + 1e-9f);
+    int lv = (int)((db - floor_db) / (-floor_db) * 100.f);
+    return lv < 0 ? 0 : (lv > 100 ? 100 : lv);
+}
+
+// Spektrum + Membran/Haptik-Pegel berechnen und unter lock als Snapshot ablegen.
+static void analyser_compute(struct data *d, const float *block512,
+                             const uint8_t *hap) {
+    if (!g_ana_init) analyser_init();
+    static float re[FFT_N], im[FFT_N];
+    double msum = 0.0;
+    for (int i = 0; i < FFT_N; i++) {
+        float mono = 0.5f * (block512[i*CHANNELS] + block512[i*CHANNELS+1]);
+        msum += (double)mono * mono;
+        re[i] = mono * g_hann[i];
+        im[i] = 0.f;
+    }
+    fft512(re, im);
+    int bands[NBANDS];
+    for (int b = 0; b < NBANDS; b++) {
+        double p = 0.0;
+        for (int k = g_band_lo[b]; k < g_band_hi[b]; k++)
+            p += (double)re[k]*re[k] + (double)im[k]*im[k];
+        float mag = (float)(sqrt(p / (g_band_hi[b] - g_band_lo[b])) / (FFT_N / 2));
+        bands[b] = db_to_level(mag, -80.f);
+    }
+    int mem = db_to_level((float)sqrt(msum / FFT_N), -70.f);
+    // Haptik-Pegel aus den tatsaechlich gesendeten int8-Samples (RMS).
+    double hsum = 0.0;
+    for (int i = 0; i < HAPTIC_N; i++) {
+        int s = (int8_t)hap[i];
+        hsum += (double)s * s;
+    }
+    int hap_lv = db_to_level((float)sqrt(hsum / HAPTIC_N) / 127.f, -70.f);
+
+    pthread_mutex_lock(&d->lock);
+    for (int b = 0; b < NBANDS; b++) d->ana_bands[b] = bands[b];
+    d->ana_mem = mem; d->ana_hap = hap_lv;
+    pthread_mutex_unlock(&d->lock);
+}
 
 // --- 0x36-Paket bauen + senden ------------------------------------------------
 static void send_block(struct data *d, const float *block512) {
+    // Web-UI aenderte den Cutoff -> Biquad hier (Audio-Thread) neu rechnen.
+    pthread_mutex_lock(&d->lock);
+    if (d->cfg_apply) { sub_set_cutoff(d, d->cfg.cutoff); d->cfg_apply = 0; }
+    pthread_mutex_unlock(&d->lock);
+
+    // Config-Datei ~1x/s auf Aenderung pruefen -> live an/aus + Param-Tweak.
+    if (++d->cfg_ctr >= CFG_CHECK_PKTS) {
+        d->cfg_ctr = 0;
+        struct stat st;
+        if (stat(d->cfg_path, &st) == 0 && st.st_mtime != d->cfg_mtime) {
+            pthread_mutex_lock(&d->lock);
+            d->cfg_mtime = st.st_mtime;
+            load_config(d);             // externer Datei-Edit (nicht via Web-UI)
+            pthread_mutex_unlock(&d->lock);
+        }
+    }
     // Resample 512 -> 480 (linear), Fade-In, Float fuer opus_encode_float
     float out[OPUS_FRAME * CHANNELS];
     double step = (double)(INPUT_BLOCK - 1) / (OPUS_FRAME - 1);
@@ -102,7 +368,8 @@ static void send_block(struct data *d, const float *block512) {
     pkt[10] = d->counter;
     pkt[11] = 0x10 | 0x80; pkt[12] = STATE_SNAP_SIZE;
     memcpy(pkt + 13, STATE_SNAPSHOT, STATE_SNAP_SIZE);
-    pkt[76] = 0x12 | 0x80; pkt[77] = 64;               // Haptik = Stille
+    pkt[76] = 0x12 | 0x80; pkt[77] = HAPTIC_N;
+    build_haptic(d, block512, pkt + 78);               // Haptik = Subwoofer-Bass
     pkt[142] = 0x13 | 0x80; pkt[143] = SPEAKER_BYTES;
     memcpy(pkt + 144, opus, n);                         // Rest ist 0 (CBR=200)
     uint32_t crc = ds_crc(pkt, REPORT_SIZE - 4);
@@ -116,6 +383,9 @@ static void send_block(struct data *d, const float *block512) {
     }
     d->seq = (d->seq + 1) & 0x0F;
     d->counter = (d->counter + 1) & 0xFF;
+
+    // Analyser nur rechnen, wenn ein Browser verbunden ist (sonst 0 Overhead).
+    if (d->web_clients > 0) analyser_compute(d, block512, pkt + 78);
 }
 
 // --- 0x31 Speaker-Enable ------------------------------------------------------
@@ -185,6 +455,309 @@ static int find_hidraw(char *out, size_t outlen) {
     return found;
 }
 
+// ============================ Web/API + Analyser ==============================
+// Eingebetteter HTTP+WebSocket-Server (nur 127.0.0.1). Kein externer Dep.
+// Browser-UI: Analyser (Membran/Haptik-Split) + Config-Tweak per WebSocket.
+
+static void sha1(const uint8_t *msg, size_t len, uint8_t out[20]) {
+    uint32_t h0=0x67452301,h1=0xEFCDAB89,h2=0x98BADCFE,h3=0x10325476,h4=0xC3D2E1F0;
+    size_t ml = len * 8, total = ((len + 8) / 64 + 1) * 64;
+    uint8_t *m = calloc(total, 1);
+    if (!m) return;
+    memcpy(m, msg, len); m[len] = 0x80;
+    for (int i = 0; i < 8; i++) m[total-1-i] = (uint8_t)((ml >> (8*i)) & 0xFF);
+    for (size_t off = 0; off < total; off += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++)
+            w[i] = (m[off+4*i]<<24)|(m[off+4*i+1]<<16)|(m[off+4*i+2]<<8)|m[off+4*i+3];
+        for (int i = 16; i < 80; i++) { uint32_t v=w[i-3]^w[i-8]^w[i-14]^w[i-16];
+            w[i]=(v<<1)|(v>>31); }
+        uint32_t a=h0,b=h1,c=h2,d=h3,e=h4;
+        for (int i = 0; i < 80; i++) {
+            uint32_t f,k;
+            if (i<20){f=(b&c)|((~b)&d);k=0x5A827999;}
+            else if (i<40){f=b^c^d;k=0x6ED9EBA1;}
+            else if (i<60){f=(b&c)|(b&d)|(c&d);k=0x8F1BBCDC;}
+            else {f=b^c^d;k=0xCA62C1D6;}
+            uint32_t t=((a<<5)|(a>>27))+f+e+k+w[i];
+            e=d;d=c;c=(b<<30)|(b>>2);b=a;a=t;
+        }
+        h0+=a;h1+=b;h2+=c;h3+=d;h4+=e;
+    }
+    free(m);
+    uint32_t hs[5]={h0,h1,h2,h3,h4};
+    for (int i=0;i<5;i++){ out[4*i]=(hs[i]>>24)&0xFF; out[4*i+1]=(hs[i]>>16)&0xFF;
+        out[4*i+2]=(hs[i]>>8)&0xFF; out[4*i+3]=hs[i]&0xFF; }
+}
+
+static void b64(const uint8_t *in, int n, char *out) {
+    static const char *t="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int i, o=0;
+    for (i=0;i+2<n;i+=3){ out[o++]=t[in[i]>>2]; out[o++]=t[((in[i]&3)<<4)|(in[i+1]>>4)];
+        out[o++]=t[((in[i+1]&15)<<2)|(in[i+2]>>6)]; out[o++]=t[in[i+2]&63]; }
+    int rem=n-i;
+    if (rem==1){ out[o++]=t[in[i]>>2]; out[o++]=t[(in[i]&3)<<4]; out[o++]='='; out[o++]='='; }
+    else if (rem==2){ out[o++]=t[in[i]>>2]; out[o++]=t[((in[i]&3)<<4)|(in[i+1]>>4)];
+        out[o++]=t[(in[i+1]&15)<<2]; out[o++]='='; }
+    out[o]=0;
+}
+
+static const char PAGE[] =
+"<!doctype html><html lang=de><head><meta charset=utf-8>"
+"<meta name=viewport content='width=device-width,initial-scale=1'>"
+"<title>DualSense BT Speaker</title><style>"
+"body{font-family:system-ui,sans-serif;background:#d6d6d6;color:#222;margin:0;padding:18px}"
+".card{background:#f0f0f0;border:1px solid #bbb;border-radius:10px;padding:16px;"
+"max-width:760px;margin:0 auto 14px;box-shadow:0 1px 3px rgba(0,0,0,.12)}"
+"h1{font-size:19px;margin:0 0 2px}.sub{color:#666;font-size:13px;margin:0 0 12px}"
+"#stat{font-size:12px;color:#777}"
+"canvas{width:100%;height:200px;background:#fafafa;border:1px solid #ccc;border-radius:6px;display:block}"
+".legend{font-size:12px;color:#555;margin-top:6px}"
+".sw{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:middle;margin:0 4px 0 12px}"
+".meter{height:16px;background:#e2e2e2;border:1px solid #c4c4c4;border-radius:4px;overflow:hidden;margin:3px 0 10px}"
+".meter>div{height:100%;width:0;transition:width .05s}"
+".row{display:flex;align-items:center;gap:10px;margin:10px 0}"
+".row label{width:92px;font-size:14px}.row output{width:64px;text-align:right;font-variant-numeric:tabular-nums}"
+"input[type=range]{flex:1;accent-color:#3a7ca5}"
+"input[type=checkbox]{width:18px;height:18px;accent-color:#3a7ca5}"
+"</style></head><body>"
+"<div class=card><h1>DualSense BT Speaker</h1>"
+"<p class=sub>Rumble as Subwoofer &middot; Analyser &amp; Tweak &middot; <span id=stat>verbinde&hellip;</span></p>"
+"<canvas id=cv width=720 height=200></canvas>"
+"<div class=legend><span class=sw style=background:#d98a2b></span>Haptik (Bass &lt; Cutoff)"
+"<span class=sw style=background:#3a7ca5></span>Membran (&ge; Cutoff)"
+"<span style=color:#c0392b;margin-left:12px>&#9474;</span> Cutoff</div></div>"
+"<div class=card>"
+"<div style='font-size:13px;color:#555'>Pegel Membran</div><div class=meter><div id=mm style=background:#3a7ca5></div></div>"
+"<div style='font-size:13px;color:#555'>Pegel Haptik</div><div class=meter><div id=mh style=background:#d98a2b></div></div>"
+"<div class=row><label>Subwoofer</label><input type=checkbox id=on><output id=on_v></output></div>"
+"<div class=row><label>Cutoff</label><input type=range id=cut min=40 max=400 step=5><output id=cut_v></output></div>"
+"<div class=row><label>Gain</label><input type=range id=gain min=0 max=8 step=0.1><output id=gain_v></output></div>"
+"<div class=row><label>Amp-Cap</label><input type=range id=amp min=1 max=127 step=1><output id=amp_v></output></div>"
+"</div><script>"
+"let ws,bf=null,init=false;"
+"const cv=document.getElementById('cv'),cx=cv.getContext('2d');"
+"function st(s){document.getElementById('stat').textContent=s;}"
+"function send(k,v){if(ws&&ws.readyState==1)ws.send(JSON.stringify({k:k,v:v}));}"
+"function bind(id,key,fmt){let el=document.getElementById(id),o=document.getElementById(id+'_v');"
+"el.addEventListener('input',()=>{o.textContent=fmt(el.value);send(key,parseFloat(el.value));});}"
+"document.getElementById('on').addEventListener('change',e=>{"
+"document.getElementById('on_v').textContent=e.target.checked?'an':'aus';send('on',e.target.checked?1:0);});"
+"bind('cut','cut',v=>v+' Hz');bind('gain','gain',v=>(+v).toFixed(1));bind('amp','amp',v=>v);"
+"function draw(b,cut){let W=cv.width,H=cv.height;cx.clearRect(0,0,W,H);if(!bf)return;"
+"let n=b.length,bw=W/n;for(let i=0;i<n;i++){let h=b[i]/100*H;"
+"cx.fillStyle=(bf[i]<cut)?'#d98a2b':'#3a7ca5';cx.fillRect(i*bw+1,H-h,bw-2,h);}"
+"let ci=0;for(let i=0;i<n;i++){if(bf[i]>=cut){ci=i;break;}}let x=ci*bw;"
+"cx.strokeStyle='#c0392b';cx.lineWidth=2;cx.beginPath();cx.moveTo(x,0);cx.lineTo(x,H);cx.stroke();}"
+"function update(m){document.getElementById('mm').style.width=m.mem+'%';"
+"document.getElementById('mh').style.width=m.hap+'%';draw(m.b,m.cut);"
+"if(!init){init=true;let on=document.getElementById('on');on.checked=!!m.on;"
+"document.getElementById('on_v').textContent=m.on?'an':'aus';"
+"let c=document.getElementById('cut');c.value=m.cut;document.getElementById('cut_v').textContent=m.cut+' Hz';"
+"let g=document.getElementById('gain');g.value=m.gain;document.getElementById('gain_v').textContent=(+m.gain).toFixed(1);"
+"let a=document.getElementById('amp');a.value=m.amp;document.getElementById('amp_v').textContent=m.amp;}}"
+"function conn(){ws=new WebSocket('ws://'+location.host+'/ws');"
+"ws.onopen=()=>st('verbunden');ws.onclose=()=>{st('getrennt \\u2014 reconnect\\u2026');init=false;setTimeout(conn,1000);};"
+"ws.onmessage=e=>{let m=JSON.parse(e.data);if(m.bf){bf=m.bf;return;}update(m);};}"
+"function fit(){cv.width=cv.clientWidth;cv.height=cv.clientHeight;}"
+"addEventListener('resize',fit);fit();conn();</script></body></html>";
+
+static char g_bf_json[512];   // {"bf":[..]} einmal pro Client gesendet
+
+static int ws_send(int fd, const char *msg) {
+    size_t len = strlen(msg);
+    uint8_t hdr[4]; int hl;
+    if (len < 126) { hdr[0]=0x81; hdr[1]=(uint8_t)len; hl=2; }
+    else { hdr[0]=0x81; hdr[1]=126; hdr[2]=(len>>8)&0xFF; hdr[3]=len&0xFF; hl=4; }
+    if (send(fd, hdr, hl, MSG_NOSIGNAL) < 0) return -1;
+    if (send(fd, msg, len, MSG_NOSIGNAL) < 0) return -1;
+    return 0;
+}
+
+// Eingehende WS-Config-Nachricht: {"k":"cut","v":150} (whitespace-tolerant).
+static void web_apply(struct data *d, const char *payload) {
+    char k[16] = {0}; double v;
+    const char *kp = strstr(payload, "\"k\"");
+    const char *vp = strstr(payload, "\"v\"");
+    if (!kp || !vp) return;
+    kp = strchr(kp + 3, ':'); if (!kp) return;
+    while (*kp == ':' || *kp == ' ' || *kp == '"') kp++;
+    int i = 0; while (*kp && *kp != '"' && i < 15) k[i++] = *kp++;
+    k[i] = 0;
+    vp = strchr(vp + 3, ':'); if (!vp) return;
+    v = atof(vp + 1);
+    pthread_mutex_lock(&d->lock);
+    if (!strcmp(k, "cut")) {
+        d->cfg.cutoff = (float)(v < 20 ? 20 : (v > 2000 ? 2000 : v));
+        d->cfg_apply = 1;
+    } else if (!strcmp(k, "gain")) {
+        d->cfg.gain = (float)(v < 0 ? 0 : (v > 8 ? 8 : v));
+    } else if (!strcmp(k, "amp")) {
+        int a = (int)v; d->cfg.amp = a < 1 ? 1 : (a > 127 ? 127 : a);
+    } else if (!strcmp(k, "on")) {
+        d->cfg.enabled = (v != 0);
+    }
+    save_config(d);                 // persistieren (+ cfg_mtime, kein Reload-Echo)
+    pthread_mutex_unlock(&d->lock);
+}
+
+static int http_read(int fd, char *buf, int cap) {
+    int n = 0;
+    while (n < cap - 1) {
+        int r = recv(fd, buf + n, cap - 1 - n, 0);
+        if (r <= 0) break;
+        n += r;
+        buf[n] = 0;
+        if (strstr(buf, "\r\n\r\n")) break;
+    }
+    buf[n] = 0;
+    return n;
+}
+
+// Neue Verbindung annehmen: WebSocket-Handshake oder die Seite ausliefern.
+// Rueckgabe: fd (>=0) wenn es ein WS-Client wurde, sonst -1 (Seite + close).
+static int web_accept(int lfd) {
+    struct sockaddr_in ca; socklen_t cl = sizeof(ca);
+    int fd = accept(lfd, (struct sockaddr*)&ca, &cl);
+    if (fd < 0) return -1;
+    struct timeval tv = {3, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char req[2048];
+    if (http_read(fd, req, sizeof(req)) <= 0) { close(fd); return -1; }
+    char *key = strstr(req, "Sec-WebSocket-Key:");
+    if (!key) {                                   // normale HTTP-Anfrage -> Seite
+        char hdr[256];
+        int len = (int)strlen(PAGE);
+        int hl = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n", len);
+        send(fd, hdr, hl, MSG_NOSIGNAL);
+        send(fd, PAGE, len, MSG_NOSIGNAL);
+        close(fd);
+        return -1;
+    }
+    key += 18;
+    while (*key == ' ') key++;
+    char k[128]; int i = 0;
+    while (*key && *key != '\r' && *key != '\n' && i < 100) k[i++] = *key++;
+    k[i] = 0;
+    char cat[200]; snprintf(cat, sizeof(cat),
+        "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", k);
+    uint8_t dig[20]; sha1((uint8_t*)cat, strlen(cat), dig);
+    char acc[40]; b64(dig, 20, acc);
+    char resp[256];
+    int rl = snprintf(resp, sizeof(resp),
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
+    send(fd, resp, rl, MSG_NOSIGNAL);
+    tv.tv_sec = 0; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    ws_send(fd, g_bf_json);                       // Band-Frequenzen einmalig
+    return fd;
+}
+
+// Eingehende WS-Frames verarbeiten. -1 = Verbindung schliessen. Mehrere Frames
+// koennen TCP-koalesziert in einem recv() ankommen -> alle im Puffer abarbeiten.
+static int web_recv(struct data *d, int fd) {
+    uint8_t b[4096];
+    int n = recv(fd, b, sizeof(b), 0);
+    if (n <= 0) return (n == 0) ? -1 : (errno == EAGAIN ? 0 : -1);
+    int pos = 0;
+    while (pos + 2 <= n) {
+        int opcode = b[pos] & 0x0F, masked = b[pos+1] & 0x80;
+        int len = b[pos+1] & 0x7F, idx = pos + 2;
+        if (len == 126) { if (pos + 4 > n) break; len = (b[pos+2]<<8)|b[pos+3]; idx = pos + 4; }
+        if (opcode == 0x8) return -1;             // close
+        if (!masked || len > 1024 || idx + 4 + len > n) break;
+        uint8_t *mask = b + idx, *pl = b + idx + 4;
+        for (int i = 0; i < len; i++) pl[i] ^= mask[i & 3];
+        uint8_t saved = pl[len]; pl[len] = 0;
+        if (opcode == 0x1) web_apply(d, (char*)pl);  // Text -> Config
+        pl[len] = saved;
+        pos = idx + 4 + len;
+    }
+    return 0;
+}
+
+static void *web_thread(void *arg) {
+    struct data *d = arg;
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) return NULL;
+    int one = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a; memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // nur 127.0.0.1
+    a.sin_port = htons((uint16_t)d->cfg.web_port);
+    if (bind(lfd, (struct sockaddr*)&a, sizeof(a)) < 0 || listen(lfd, 8) < 0) {
+        fprintf(stderr, "Web-UI: Port %d nicht bindbar (%s) — UI aus.\n",
+                d->cfg.web_port, strerror(errno));
+        close(lfd); return NULL;
+    }
+    fprintf(stderr, "Web-UI: http://localhost:%d\n", d->cfg.web_port);
+
+    int cfd[WEB_MAX_CLIENTS]; for (int i = 0; i < WEB_MAX_CLIENTS; i++) cfd[i] = -1;
+    struct timespec last; clock_gettime(CLOCK_MONOTONIC, &last);
+    for (;;) {
+        struct pollfd pfd[WEB_MAX_CLIENTS + 1];
+        pfd[0].fd = lfd; pfd[0].events = POLLIN;
+        int nf = 1;
+        for (int i = 0; i < WEB_MAX_CLIENTS; i++)
+            if (cfd[i] >= 0) { pfd[nf].fd = cfd[i]; pfd[nf].events = POLLIN; nf++; }
+        poll(pfd, nf, 50);
+
+        if (pfd[0].revents & POLLIN) {
+            int slot = -1;
+            for (int i = 0; i < WEB_MAX_CLIENTS; i++) if (cfd[i] < 0) { slot = i; break; }
+            int nfd = web_accept(lfd);
+            if (nfd >= 0) {
+                if (slot < 0) { close(nfd); }      // voll -> ablehnen
+                else { cfd[slot] = nfd; d->web_clients++; }
+            }
+        }
+        for (int p = 1; p < nf; p++) {
+            if (!(pfd[p].revents & (POLLIN|POLLHUP|POLLERR))) continue;
+            int fd = pfd[p].fd;
+            if (web_recv(d, fd) < 0) {
+                for (int i = 0; i < WEB_MAX_CLIENTS; i++) if (cfd[i] == fd) cfd[i] = -1;
+                close(fd); d->web_clients--;
+            }
+        }
+        // ~20x/s Analyser+Config an alle Clients senden
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        double ms = (now.tv_sec-last.tv_sec)*1000.0 + (now.tv_nsec-last.tv_nsec)/1e6;
+        if (ms >= 45.0) {
+            last = now;
+            char msg[768]; int o;
+            pthread_mutex_lock(&d->lock);
+            o = snprintf(msg, sizeof(msg),
+                "{\"on\":%d,\"cut\":%.0f,\"gain\":%.2f,\"amp\":%d,\"mem\":%d,\"hap\":%d,\"b\":[",
+                d->cfg.enabled, d->cfg.cutoff, d->cfg.gain, d->cfg.amp,
+                d->ana_mem, d->ana_hap);
+            for (int bnd = 0; bnd < NBANDS; bnd++)
+                o += snprintf(msg+o, sizeof(msg)-o, "%s%d", bnd?",":"", d->ana_bands[bnd]);
+            pthread_mutex_unlock(&d->lock);
+            o += snprintf(msg+o, sizeof(msg)-o, "]}");
+            for (int i = 0; i < WEB_MAX_CLIENTS; i++)
+                if (cfd[i] >= 0 && ws_send(cfd[i], msg) < 0) {
+                    close(cfd[i]); cfd[i] = -1; d->web_clients--;
+                }
+        }
+    }
+    return NULL;
+}
+
+static void web_ui_start(struct data *d) {
+    analyser_init();                              // Band-Frequenzen bereitstellen
+    int o = snprintf(g_bf_json, sizeof(g_bf_json), "{\"bf\":[");
+    for (int b = 0; b < NBANDS; b++)
+        o += snprintf(g_bf_json+o, sizeof(g_bf_json)-o, "%s%d", b?",":"",
+                      (int)(g_band_hz[b] + 0.5f));
+    snprintf(g_bf_json+o, sizeof(g_bf_json)-o, "]}");
+    pthread_t th;
+    pthread_create(&th, NULL, web_thread, d);
+    pthread_detach(th);
+}
+
 int main(int argc, char **argv) {
     pw_init(&argc, &argv);
     struct data d; memset(&d, 0, sizeof(d));
@@ -212,6 +785,22 @@ int main(int argc, char **argv) {
     opus_encoder_ctl(d.enc, OPUS_SET_BITRATE(OPUS_BITRATE));
     opus_encoder_ctl(d.enc, OPUS_SET_VBR(0));            // CBR -> feste 200 byte
     opus_encoder_ctl(d.enc, OPUS_SET_COMPLEXITY(0));
+
+    // Subwoofer-Defaults + Config (~/.DS5/config beim ersten Start anlegen).
+    pthread_mutex_init(&d.lock, NULL);
+    d.cfg.enabled = 1; d.cfg.cutoff = 200.f; d.cfg.gain = 2.6f; d.cfg.amp = 64;
+    d.cfg.web = 1; d.cfg.web_port = WEB_PORT_DEFAULT;
+    const char *home = getenv("HOME");
+    if (home) snprintf(d.cfg_path, sizeof(d.cfg_path), "%s/.DS5/config", home);
+    struct stat st;
+    if (home && stat(d.cfg_path, &st) != 0) write_default_config(&d);
+    sub_set_cutoff(&d, d.cfg.cutoff);                   // Biquad initialisieren
+    load_config(&d);                                    // ggf. User-Werte uebernehmen
+    if (stat(d.cfg_path, &st) == 0) d.cfg_mtime = st.st_mtime;
+    fprintf(stderr, "Subwoofer: %s  cutoff=%.0f Hz gain=%.2f amp=%d  (~/.DS5/config)\n",
+            d.cfg.enabled ? "an" : "aus", d.cfg.cutoff, d.cfg.gain, d.cfg.amp);
+
+    if (d.cfg.web) web_ui_start(&d);
 
     send_setup(d.hidraw_fd);
     // Preroll: Stille-Frames laufen einfach mit (acc startet leer -> Stille)

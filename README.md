@@ -9,8 +9,15 @@ that no mainstream Linux tool implements. This project does: it registers a
 native PipeWire sink called **"DualSense BT Speaker"** that you can select in
 your normal sound menu, complete with a volume slider.
 
+As of **0.2** it also drives the controller's two haptic actuators as a
+**"Rumble as Subwoofer"** — a low-passed copy of the audio goes to the haptic
+motors, so the bass you feel in your hands fills in the low end the little
+membrane speaker can't reach. It's on by default and configurable, including a
+small **built-in web UI with a live analyser** at `http://localhost:8118`.
+
 ```
 PipeWire graph ──PCM──▶ ds5_membrane_sink ──Opus/0x36──▶ DualSense (Bluetooth)
+                                   └─ low-pass ─▶ haptics (bass / "subwoofer")
 ```
 
 ## How it works
@@ -27,6 +34,7 @@ make it work — none of them documented by Sony:
 | Checksum | CRC-32 with seed `0xA2` over the first 394 bytes |
 | Speaker enable | report `0x31`: `audio_control = 0x30` (speaker path), preamp `0x02` |
 | Config mask | `0x11` byte 4 = **`0xFE`** — bit 0 *cleared*. See "Audio + gamepad" below. |
+| Haptics (subwoofer) | sub-packet `0x12`: **64 × int8 PCM @ 6 kHz** (one packet = one haptic frame). Low-passed bass, see "Rumble as Subwoofer". |
 
 Two details matter most:
 
@@ -52,6 +60,69 @@ reports, so Steam Input / the kernel / any mapper see a perfectly normal gamepad
 > app enabled the mic), reconnect it once (PS button) to clear it. The optional
 > `mapper/ds5_keymap.py` (stick→WASD straight from hidraw, dropping any stray
 > `0xd4` audio frames) is kept as a safety net for that case.
+
+## Rumble as Subwoofer 🔊
+
+The membrane speaker is tiny and has essentially no bass. But the DualSense has
+**two voice-coil haptic actuators** that are, physically, little body-sound
+subwoofers — a 50–200 Hz tone on the haptic route is *felt* in your hands and
+*heard* as low-end pressure. So the sink sends a **low-passed copy of the audio
+to the haptics** in parallel with the full-range signal to the speaker. On music
+with a kick/bass drum this gives the controller a real low end. It is **on by
+default**.
+
+The haptic route is `0x12`: 64 × int8 PCM at 6 kHz, exactly one frame per
+`0x36` packet. Per block: mix to mono → biquad low-pass → DC-block → decimate
+48 kHz → 6 kHz (512 / 8 = 64 samples).
+
+> Note: the actuators have a slow impulse response, so this adds *weight and
+> pressure*, not a snappy transient — a sub, not a tweeter.
+
+### Configure it — `~/.DS5/config`
+
+On first run the service writes `~/.DS5/config` with the defaults. **Editing and
+saving it takes effect within ~1 second — no restart needed** (the service
+re-reads the file when its modification time changes). To turn the subwoofer off
+entirely, set `subwoofer = off`:
+
+```ini
+subwoofer = on        # on | off
+cutoff_hz = 200       # low-pass cutoff in Hz (typ. 120..200)
+gain      = 2.6       # haptic gain (higher = stronger / denser)
+amp       = 64        # int8 amplitude cap, max 127
+web       = on        # web UI / API (localhost only)
+web_port  = 8118
+```
+
+Since it's a systemd user service, a full restart also works if you prefer:
+`systemctl --user restart ds5-membrane-sink`.
+
+## Web UI & analyser — `http://localhost:8118`
+
+The service has a small built-in web server (no extra dependency — plain C,
+distribution-agnostic) so you can **tune by ear in the browser** and watch a
+**live audio analyser showing the membrane / haptic split**:
+
+- A spectrum where the **bass bands below the cutoff** (sent to the haptics) are
+  drawn in amber and **everything above** (the membrane) in steel blue, with a
+  red line marking the cutoff — drag the cutoff slider and watch the split move.
+- Two level meters: **membrane** (full range) and **haptic** (the actual bass
+  going to the actuators).
+- Sliders for subwoofer on/off, cutoff, gain and amp cap. Changes apply
+  **instantly** (over a WebSocket) and are saved to `~/.DS5/config`.
+
+Open **http://localhost:8118** in any browser while audio plays.
+
+- It binds **localhost only** — not reachable from the network, no auth needed.
+- The analyser FFT only runs **while a browser is connected**, so the always-on
+  service has zero overhead otherwise.
+- The config file and the web UI are two views of the same settings; editing
+  either updates the other.
+
+> The web UI is the intended way to tweak. To find values purely on the command
+> line instead, `reverse_engineered/sub_tune.py` is a curses tuner that sweeps
+> cutoff / gain / amp live while music plays (it stops the service while running,
+> then prints the command to start it again).
 
 ## Quick start
 
@@ -100,7 +171,7 @@ cd src && make service-usb
 
 ```
 src/                    native PipeWire sink over BLUETOOTH (the real product)
-  ds5_membrane_sink.c   ~250 lines of C: PipeWire node + Opus + 0x36 + CRC
+  ds5_membrane_sink.c   C: PipeWire node + Opus + 0x36 + CRC + haptic subwoofer + web UI
   Makefile              make / make service / make service-usb
   ds5-membrane-sink.service
 usb/                    wired variant (4ch USB-audio card + HID enable)
@@ -113,6 +184,7 @@ reverse_engineered/     the tools that cracked the BT protocol (see its README)
   ps5bt_membrane.py     Python reference implementation of the speaker path
   ps5bt_speaker.py      the earlier haptics-path experiments
   tune.py               interactive curses tuner used during RE
+  sub_tune.py           live tuner for the "Rumble as Subwoofer" cutoff/gain
   init_probe.py         TUI that found the mask bit-0 mic-capture switch
   check_input.py        shows gamepad vs d4-feedback rate from hidraw
   run.sh                test harness (tones, sweeps, diagnostics)
@@ -124,6 +196,9 @@ reverse_engineered/     the tools that cracked the BT protocol (see its README)
 - ✅ Membrane speaker over Bluetooth, smooth, full range (verified to 2 kHz+)
 - ✅ Native PipeWire sink, selectable device, volume control
 - ✅ Microphone muted, indicator LED quiet, no input-event interference
+- ✅ Audio + gamepad work simultaneously (mask `0xFE`)
+- ✅ "Rumble as Subwoofer": low-passed bass on the haptics, live-configurable
+- ✅ Built-in web UI + live analyser at `localhost:8118` (no extra dependency)
 - ⚠️ A short start-up transient (speaker amp power-on pop) may remain
 
 ## Tested with

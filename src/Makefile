@@ -6,8 +6,8 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra
 PKGS     = libpipewire-0.3 opus zlib
-CFLAGS  += $(shell pkg-config --cflags $(PKGS))
-LDLIBS   = $(shell pkg-config --libs $(PKGS))
+CFLAGS  += $(shell pkg-config --cflags $(PKGS)) -pthread
+LDLIBS   = $(shell pkg-config --libs $(PKGS)) -lm -pthread
 
 TARGET   = ds5_membrane_sink
 
