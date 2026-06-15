@@ -33,7 +33,8 @@
 #include <errno.h>
 
 #define SRC_RATE        48000
-#define CHANNELS        2
+#define CHANNELS        2          // Opus an den Controller: stereo (DS5_Bridge)
+#define SINK_CH         1          // PipeWire-Sink: MONO (Membran ist 1 Lautsprecher)
 #define INPUT_BLOCK     512        // Frames pro Sende-Block (DS5_Bridge)
 #define OPUS_FRAME      480        // Opus-Frame nach Resampling
 #define OPUS_BITRATE    (200*8*100) // 160 kbps CBR -> exakt 200 byte/frame
@@ -98,7 +99,7 @@ struct data {
     int fade_pos;
     int preroll_done;
 
-    float acc[INPUT_BLOCK * CHANNELS];   // Akkumulator fuer 512-Frame-Bloecke
+    float acc[INPUT_BLOCK];              // Akkumulator (MONO) fuer 512-Frame-Bloecke
     int acc_frames;
     int write_errors;                    // -> Controller weg -> Loop beenden
 
@@ -227,7 +228,7 @@ static void build_haptic(struct data *d, const float *block512, uint8_t *hap) {
         float last = 0.f;
         for (int j = 0; j < HAPTIC_DECIM; j++) {
             int fr = i * HAPTIC_DECIM + j;
-            float mono = 0.5f * (block512[fr*CHANNELS] + block512[fr*CHANNELS+1]);
+            float mono = block512[fr];              // Sink ist mono
             float y = d->bq_b0*mono + d->bq_b1*d->bq_x1 + d->bq_b2*d->bq_x2
                       - d->bq_a1*d->bq_y1 - d->bq_a2*d->bq_y2;
             d->bq_x2 = d->bq_x1; d->bq_x1 = mono;
@@ -309,7 +310,7 @@ static void analyser_compute(struct data *d, const float *block512,
     static float re[FFT_N], im[FFT_N];
     double msum = 0.0;
     for (int i = 0; i < FFT_N; i++) {
-        float mono = 0.5f * (block512[i*CHANNELS] + block512[i*CHANNELS+1]);
+        float mono = block512[i];               // Sink ist mono
         msum += (double)mono * mono;
         re[i] = mono * g_hann[i];
         im[i] = 0.f;
@@ -357,23 +358,20 @@ static void send_block(struct data *d, const float *block512) {
         }
     }
     // Resample 512 -> 480 (linear), Fade-In, Float fuer opus_encode_float
-    float out[OPUS_FRAME * CHANNELS];
+    float out[OPUS_FRAME * CHANNELS];   // stereo fuer Opus (Controller erwartet 2ch)
     double step = (double)(INPUT_BLOCK - 1) / (OPUS_FRAME - 1);
     for (int i = 0; i < OPUS_FRAME; i++) {
         double src = i * step;
         int idx = (int)src;
         int nxt = idx < INPUT_BLOCK - 1 ? idx + 1 : idx;
         float frac = (float)(src - idx);
-        for (int ch = 0; ch < CHANNELS; ch++) {
-            float a = block512[idx*CHANNELS+ch];
-            float b = block512[nxt*CHANNELS+ch];
-            float v = a + (b - a) * frac;
-            if (d->fade_pos < FADE_SAMPLES) {
-                int s = d->fade_pos + i;
-                if (s < FADE_SAMPLES) v *= (float)s / FADE_SAMPLES;
-            }
-            out[i*CHANNELS+ch] = v;
+        float a = block512[idx], b = block512[nxt];      // Mono-Input
+        float v = a + (b - a) * frac;
+        if (d->fade_pos < FADE_SAMPLES) {
+            int s = d->fade_pos + i;
+            if (s < FADE_SAMPLES) v *= (float)s / FADE_SAMPLES;
         }
+        out[i*CHANNELS] = out[i*CHANNELS+1] = v;         // Mono -> L=R
     }
     if (d->fade_pos < FADE_SAMPLES) d->fade_pos += OPUS_FRAME;
 
@@ -443,10 +441,9 @@ static void on_process(void *userdata) {
     float *samples = buf->datas[0].data;
     if (samples) {
         uint32_t n_bytes = buf->datas[0].chunk->size;
-        uint32_t n_frames = n_bytes / (sizeof(float) * CHANNELS);
+        uint32_t n_frames = n_bytes / (sizeof(float) * SINK_CH);
         for (uint32_t f = 0; f < n_frames; f++) {
-            d->acc[d->acc_frames*CHANNELS]   = samples[f*CHANNELS];
-            d->acc[d->acc_frames*CHANNELS+1] = samples[f*CHANNELS+1];
+            d->acc[d->acc_frames] = samples[f];   // mono
             if (++d->acc_frames >= INPUT_BLOCK) {
                 send_block(d, d->acc);
                 d->acc_frames = 0;
@@ -942,7 +939,8 @@ int main(int argc, char **argv) {
     struct spa_audio_info_raw info = {
         .format = SPA_AUDIO_FORMAT_F32,
         .rate = SRC_RATE,
-        .channels = CHANNELS,
+        .channels = SINK_CH,                 // mono -> GNOME zeigt testbaren Lautsprecher
+        .position = { SPA_AUDIO_CHANNEL_MONO },
     };
     const struct spa_pod *params[1];
     params[0] = spa_format_audio_raw_build(&bld, SPA_PARAM_EnumFormat, &info);
@@ -970,6 +968,7 @@ int main(int argc, char **argv) {
     struct spa_pod_builder sbld = SPA_POD_BUILDER_INIT(sbuf, sizeof(sbuf));
     struct spa_audio_info_raw sinfo = {
         .format = SPA_AUDIO_FORMAT_F32, .rate = MIC_RATE, .channels = 1,
+        .position = { SPA_AUDIO_CHANNEL_MONO },
     };
     const struct spa_pod *sparams[1];
     sparams[0] = spa_format_audio_raw_build(&sbld, SPA_PARAM_EnumFormat, &sinfo);

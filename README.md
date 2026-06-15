@@ -34,7 +34,7 @@ make it work — none of them documented by Sony:
 | Piece | Value |
 |-------|-------|
 | HID output report | `0x36` (398 bytes), four sub-packets: config `0x11`, state `0x10`, haptics `0x12`, **speaker `0x13`** |
-| Audio codec | **Opus, 48 kHz stereo, CBR 160 kbps** → exactly 200 bytes/frame |
+| Audio codec | **Opus, 48 kHz stereo, CBR 160 kbps** → exactly 200 bytes/frame (the PipeWire sink itself is presented as **mono** — the membrane is a single speaker — and duplicated to L/R for the Opus the controller expects) |
 | Frame timing | **512 input samples → resampled to 480 → sent every 10.667 ms** (512/48000), *not* 10 ms |
 | Checksum | CRC-32 with seed `0xA2` over the first 394 bytes |
 | Speaker enable | report `0x31`: `audio_control = 0x30` (speaker path), preamp `0x02` |
