@@ -53,6 +53,13 @@
 #define FFT_N            512        // = INPUT_BLOCK (eine FFT pro Block)
 #define NBANDS           28         // Spektrum-Baender fuer die Analyser-Anzeige
 
+// --- Voice-In (Mikrofon ueber den 0xd4-Opus-Duplex-Stream) --------------------
+#define MIC_RATE         48000      // Mic-Opus: 48 kHz mono, 10 ms (480 Samples)
+#define MIC_FRAME        480
+#define MIC_TOC          0xD4       // konstanter Opus-TOC der Mic-Frames (= "Marker")
+#define MIC_VOL          0x40       // mic_volume im State-Snapshot wenn Mic an
+#define MIC_RING_FRAMES  48000      // 1 s Mono-Ringpuffer (decoded PCM)
+
 // --- "Rumble as Subwoofer": Bass an die Haptik-Aktuatoren ---------------------
 // Die Membran hat keinen Tiefbass; die zwei Voice-Coil-Haptik-Aktuatoren sind
 // quasi Koerperschall-Subwoofer. Wir spiegeln einen tiefpassgefilterten Mono-
@@ -64,6 +71,7 @@ struct subcfg {
     int   amp;         // int8-Amplituden-Cap (<=127), default 64
     int   web;         // Web/API-Dienst an? default 1
     int   web_port;    // default 8118
+    int   microphone;  // Voice-In (Mic-Duplex 0xFF) an? default 0 (opt-in)
 };
 
 // --- DualSense 0x31/0x36 Konstanten (aus DS5_Bridge bt.cpp/audio.cpp) ----------
@@ -109,6 +117,14 @@ struct data {
     volatile int web_clients;         // >0 -> Analyser (FFT) ueberhaupt rechnen
     int   ana_bands[NBANDS];          // 0..100 pro Band (Spektrum-Snapshot)
     int   ana_mem, ana_hap;           // 0..100 Pegel Membran / Haptik
+    int   ana_mic;                    // 0..100 Pegel Mikrofon
+
+    // Voice-In: hidraw-Reader-Thread -> Opus-Decode -> Ringpuffer -> PW-Source
+    struct pw_stream *src_stream;     // "DualSense BT Mic"
+    char  hidraw_path[64];
+    pthread_mutex_t mic_lock;
+    float mic_ring[MIC_RING_FRAMES];
+    int   mic_w, mic_r;               // Schreib-/Lese-Index (mono float)
 };
 
 // RBJ-Tiefpass-Biquad (Q=0.707, Butterworth) — Koeffizienten setzen.
@@ -151,6 +167,9 @@ static void load_config(struct data *d) {
                               !strcmp(val, "true") || !strcmp(val, "yes"));
             else if (!strcmp(key, "web_port") || !strcmp(key, "port"))
                 d->cfg.web_port = atoi(val);
+            else if (!strcmp(key, "microphone") || !strcmp(key, "mic"))
+                d->cfg.microphone = (!strcmp(val, "on") || !strcmp(val, "1") ||
+                                     !strcmp(val, "true") || !strcmp(val, "yes"));
         }
     }
     fclose(f);
@@ -174,9 +193,15 @@ static void save_config(struct data *d) {
         "\n"
         "# Web/API-Dienst (Analyser + Tweak-UI), nur localhost.\n"
         "web       = %s\n"
-        "web_port  = %d\n",
+        "web_port  = %d\n"
+        "\n"
+        "# Voice-In: DS5-Mikrofon als Aufnahmegeraet 'DualSense BT Mic'.\n"
+        "# ACHTUNG: aktiviert den Mic-Duplex (Maske 0xFF) -> verseucht den\n"
+        "# Gamepad-Input (Phantom-Stick). Nur einschalten, wenn du das Mic brauchst.\n"
+        "microphone = %s\n",
         d->cfg.web_port, d->cfg.enabled ? "on" : "off", d->cfg.cutoff,
-        d->cfg.gain, d->cfg.amp, d->cfg.web ? "on" : "off", d->cfg.web_port);
+        d->cfg.gain, d->cfg.amp, d->cfg.web ? "on" : "off", d->cfg.web_port,
+        d->cfg.microphone ? "on" : "off");
     fclose(f);
     struct stat st;
     if (stat(d->cfg_path, &st) == 0) d->cfg_mtime = st.st_mtime;
@@ -363,11 +388,17 @@ static void send_block(struct data *d, const float *block512) {
     // 0x11 config: mask 0xFE (Bit0 clear = KEIN Mic-Capture/Duplex -> kein d4-
     // Stream im Input-Channel). DS5_Bridge nutzt 0xFF (Bit0=1) fuer Voice-Chat-
     // Duplex; wir wollen nur Speaker -> Bit0 raus. Verifiziert mit init_probe.py.
-    pkt[2] = 0x11 | 0x80;  pkt[3] = 7;  pkt[4] = 0xFE;
+    // Maske 0xFE = nur Speaker (kein Mic-Duplex). 0xFF = Mic-Duplex AN (Voice-In),
+    // bringt aber den d4-Stream zurueck -> Gamepad-Input wird verseucht.
+    pkt[2] = 0x11 | 0x80;  pkt[3] = 7;  pkt[4] = d->cfg.microphone ? 0xFF : 0xFE;
     pkt[5]=pkt[6]=pkt[7]=pkt[8]=pkt[9] = 64;
     pkt[10] = d->counter;
     pkt[11] = 0x10 | 0x80; pkt[12] = STATE_SNAP_SIZE;
     memcpy(pkt + 13, STATE_SNAPSHOT, STATE_SNAP_SIZE);
+    if (d->cfg.microphone) {                 // Mic entstummen (sonst Stille-Capture)
+        pkt[13 + 6] = MIC_VOL;               // mic_volume
+        pkt[13 + 9] = 0x00;                  // power_save: mic-mute-Bit raus
+    }
     pkt[76] = 0x12 | 0x80; pkt[77] = HAPTIC_N;
     build_haptic(d, block512, pkt + 78);               // Haptik = Subwoofer-Bass
     pkt[142] = 0x13 | 0x80; pkt[143] = SPEAKER_BYTES;
@@ -530,10 +561,13 @@ static const char PAGE[] =
 "<div class=card>"
 "<div style='font-size:13px;color:#555'>Pegel Membran</div><div class=meter><div id=mm style=background:#3a7ca5></div></div>"
 "<div style='font-size:13px;color:#555'>Pegel Haptik</div><div class=meter><div id=mh style=background:#d98a2b></div></div>"
+"<div style='font-size:13px;color:#555'>Pegel Mikrofon</div><div class=meter><div id=mi style=background:#5a9e5a></div></div>"
 "<div class=row><label>Subwoofer</label><input type=checkbox id=on><output id=on_v></output></div>"
 "<div class=row><label>Cutoff</label><input type=range id=cut min=40 max=400 step=5><output id=cut_v></output></div>"
 "<div class=row><label>Gain</label><input type=range id=gain min=0 max=8 step=0.1><output id=gain_v></output></div>"
 "<div class=row><label>Amp-Cap</label><input type=range id=amp min=1 max=127 step=1><output id=amp_v></output></div>"
+"<div class=row><label>Mikrofon</label><input type=checkbox id=mic><output id=mic_v></output></div>"
+"<div style='font-size:11px;color:#999;margin-top:-4px'>Voice-In als Aufnahmeger&auml;t. Achtung: verseucht den Gamepad-Input.</div>"
 "</div><script>"
 "let ws,bf=null,init=false;"
 "const cv=document.getElementById('cv'),cx=cv.getContext('2d');"
@@ -543,6 +577,8 @@ static const char PAGE[] =
 "el.addEventListener('input',()=>{o.textContent=fmt(el.value);send(key,parseFloat(el.value));});}"
 "document.getElementById('on').addEventListener('change',e=>{"
 "document.getElementById('on_v').textContent=e.target.checked?'an':'aus';send('on',e.target.checked?1:0);});"
+"document.getElementById('mic').addEventListener('change',e=>{"
+"document.getElementById('mic_v').textContent=e.target.checked?'an':'aus';send('mic',e.target.checked?1:0);});"
 "bind('cut','cut',v=>v+' Hz');bind('gain','gain',v=>(+v).toFixed(1));bind('amp','amp',v=>v);"
 "function draw(b,cut){let W=cv.width,H=cv.height;cx.clearRect(0,0,W,H);if(!bf)return;"
 "let n=b.length,bw=W/n;for(let i=0;i<n;i++){let h=b[i]/100*H;"
@@ -550,9 +586,12 @@ static const char PAGE[] =
 "let ci=0;for(let i=0;i<n;i++){if(bf[i]>=cut){ci=i;break;}}let x=ci*bw;"
 "cx.strokeStyle='#c0392b';cx.lineWidth=2;cx.beginPath();cx.moveTo(x,0);cx.lineTo(x,H);cx.stroke();}"
 "function update(m){document.getElementById('mm').style.width=m.mem+'%';"
-"document.getElementById('mh').style.width=m.hap+'%';draw(m.b,m.cut);"
+"document.getElementById('mh').style.width=m.hap+'%';"
+"document.getElementById('mi').style.width=(m.miclv||0)+'%';draw(m.b,m.cut);"
 "if(!init){init=true;let on=document.getElementById('on');on.checked=!!m.on;"
 "document.getElementById('on_v').textContent=m.on?'an':'aus';"
+"let mc=document.getElementById('mic');mc.checked=!!m.mic;"
+"document.getElementById('mic_v').textContent=m.mic?'an':'aus';"
 "let c=document.getElementById('cut');c.value=m.cut;document.getElementById('cut_v').textContent=m.cut+' Hz';"
 "let g=document.getElementById('gain');g.value=m.gain;document.getElementById('gain_v').textContent=(+m.gain).toFixed(1);"
 "let a=document.getElementById('amp');a.value=m.amp;document.getElementById('amp_v').textContent=m.amp;}}"
@@ -596,6 +635,8 @@ static void web_apply(struct data *d, const char *payload) {
         int a = (int)v; d->cfg.amp = a < 1 ? 1 : (a > 127 ? 127 : a);
     } else if (!strcmp(k, "on")) {
         d->cfg.enabled = (v != 0);
+    } else if (!strcmp(k, "mic")) {
+        d->cfg.microphone = (v != 0);
     }
     save_config(d);                 // persistieren (+ cfg_mtime, kein Reload-Echo)
     pthread_mutex_unlock(&d->lock);
@@ -730,9 +771,10 @@ static void *web_thread(void *arg) {
             char msg[768]; int o;
             pthread_mutex_lock(&d->lock);
             o = snprintf(msg, sizeof(msg),
-                "{\"on\":%d,\"cut\":%.0f,\"gain\":%.2f,\"amp\":%d,\"mem\":%d,\"hap\":%d,\"b\":[",
+                "{\"on\":%d,\"cut\":%.0f,\"gain\":%.2f,\"amp\":%d,\"mic\":%d,"
+                "\"mem\":%d,\"hap\":%d,\"miclv\":%d,\"b\":[",
                 d->cfg.enabled, d->cfg.cutoff, d->cfg.gain, d->cfg.amp,
-                d->ana_mem, d->ana_hap);
+                d->cfg.microphone, d->ana_mem, d->ana_hap, d->ana_mic);
             for (int bnd = 0; bnd < NBANDS; bnd++)
                 o += snprintf(msg+o, sizeof(msg)-o, "%s%d", bnd?",":"", d->ana_bands[bnd]);
             pthread_mutex_unlock(&d->lock);
@@ -758,6 +800,77 @@ static void web_ui_start(struct data *d) {
     pthread_detach(th);
 }
 
+// ============================ Voice-In (Mikrofon) =============================
+// Liest hidraw, filtert die d4-Opus-Mic-Frames, dekodiert -> Mono-Ringpuffer.
+// Die PipeWire-Source unten zieht daraus. Decodiert nur wenn microphone=on.
+static void *mic_thread(void *arg) {
+    struct data *d = arg;
+    int derr;
+    OpusDecoder *dec = opus_decoder_create(MIC_RATE, 1, &derr);
+    if (derr != OPUS_OK) return NULL;
+    int16_t pcm[MIC_FRAME];
+    uint8_t buf[256];
+    for (;;) {
+        int fd = open(d->hidraw_path, O_RDONLY);
+        if (fd < 0) { sleep(1); continue; }
+        for (;;) {
+            int n = read(fd, buf, sizeof(buf));
+            if (n <= 0) break;                       // Controller weg -> reopen
+            if (buf[0] != 0x31 || n < 16 || buf[3] != MIC_TOC) continue;
+            if (!d->cfg.microphone) continue;        // Mic aus -> ignorieren
+            int ns = opus_decode(dec, buf + 3, n - 3 - 4, pcm, MIC_FRAME, 0);
+            if (ns <= 0) continue;                   // n-3-4: 4 Byte CRC weglassen
+            double sum = 0.0;
+            pthread_mutex_lock(&d->mic_lock);
+            for (int i = 0; i < ns; i++) {
+                float f = pcm[i] / 32768.f;
+                sum += (double)f * f;
+                d->mic_ring[d->mic_w] = f;
+                d->mic_w = (d->mic_w + 1) % MIC_RING_FRAMES;
+                if (d->mic_w == d->mic_r)            // Overrun -> aeltestes verwerfen
+                    d->mic_r = (d->mic_r + 1) % MIC_RING_FRAMES;
+            }
+            pthread_mutex_unlock(&d->mic_lock);
+            if (d->web_clients > 0) {
+                int lv = db_to_level((float)sqrt(sum / ns), -70.f);
+                pthread_mutex_lock(&d->lock); d->ana_mic = lv; pthread_mutex_unlock(&d->lock);
+            }
+        }
+        close(fd);
+    }
+    return NULL;
+}
+
+// PipeWire-Source-Callback: Mono-PCM aus dem Ring in den Graph schieben.
+static void on_process_src(void *userdata) {
+    struct data *d = userdata;
+    struct pw_buffer *b = pw_stream_dequeue_buffer(d->src_stream);
+    if (!b) return;
+    struct spa_buffer *buf = b->buffer;
+    float *dst = buf->datas[0].data;
+    if (dst) {
+        uint32_t req = buf->datas[0].maxsize / sizeof(float);
+        if (b->requested && b->requested < req) req = b->requested;
+        pthread_mutex_lock(&d->mic_lock);
+        for (uint32_t i = 0; i < req; i++) {
+            if (d->mic_r != d->mic_w) {
+                dst[i] = d->mic_ring[d->mic_r];
+                d->mic_r = (d->mic_r + 1) % MIC_RING_FRAMES;
+            } else dst[i] = 0.f;                     // Underrun / Mic aus -> Stille
+        }
+        pthread_mutex_unlock(&d->mic_lock);
+        buf->datas[0].chunk->offset = 0;
+        buf->datas[0].chunk->stride = sizeof(float);
+        buf->datas[0].chunk->size = req * sizeof(float);
+    }
+    pw_stream_queue_buffer(d->src_stream, b);
+}
+
+static const struct pw_stream_events src_stream_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = on_process_src,
+};
+
 int main(int argc, char **argv) {
     pw_init(&argc, &argv);
     struct data d; memset(&d, 0, sizeof(d));
@@ -777,6 +890,8 @@ int main(int argc, char **argv) {
     }
     d.hidraw_fd = open(hidraw, O_WRONLY);
     if (d.hidraw_fd < 0) { perror("open hidraw"); return 1; }
+    snprintf(d.hidraw_path, sizeof(d.hidraw_path), "%s", hidraw);
+    pthread_mutex_init(&d.mic_lock, NULL);
     fprintf(stderr, "DualSense: %s\n", hidraw);
 
     int err;
@@ -799,6 +914,8 @@ int main(int argc, char **argv) {
     if (stat(d.cfg_path, &st) == 0) d.cfg_mtime = st.st_mtime;
     fprintf(stderr, "Subwoofer: %s  cutoff=%.0f Hz gain=%.2f amp=%d  (~/.DS5/config)\n",
             d.cfg.enabled ? "an" : "aus", d.cfg.cutoff, d.cfg.gain, d.cfg.amp);
+    fprintf(stderr, "Mikrofon (Voice-In): %s%s\n", d.cfg.microphone ? "an" : "aus",
+            d.cfg.microphone ? "  — Achtung: Gamepad-Input wird verseucht" : "");
 
     if (d.cfg.web) web_ui_start(&d);
 
@@ -837,9 +954,40 @@ int main(int argc, char **argv) {
         PW_STREAM_FLAG_RT_PROCESS,
         params, 1);
 
-    fprintf(stderr, "DualSense BT Speaker als PipeWire-Sink aktiv. Strg+C beendet.\n");
+    // --- PipeWire-Source "DualSense BT Mic" (Voice-In) -----------------------
+    d.src_stream = pw_stream_new_simple(
+        pw_main_loop_get_loop(d.loop),
+        "DualSense BT Mic",
+        pw_properties_new(
+            PW_KEY_MEDIA_TYPE, "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Capture",
+            PW_KEY_MEDIA_CLASS, "Audio/Source",
+            PW_KEY_NODE_NAME, "ds5_mic",
+            PW_KEY_NODE_DESCRIPTION, "DualSense BT Mic",
+            NULL),
+        &src_stream_events, &d);
+    uint8_t sbuf[1024];
+    struct spa_pod_builder sbld = SPA_POD_BUILDER_INIT(sbuf, sizeof(sbuf));
+    struct spa_audio_info_raw sinfo = {
+        .format = SPA_AUDIO_FORMAT_F32, .rate = MIC_RATE, .channels = 1,
+    };
+    const struct spa_pod *sparams[1];
+    sparams[0] = spa_format_audio_raw_build(&sbld, SPA_PARAM_EnumFormat, &sinfo);
+    pw_stream_connect(d.src_stream,
+        PW_DIRECTION_OUTPUT,                // Source = liefert Audio (Mikrofon)
+        PW_ID_ANY,
+        PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+        PW_STREAM_FLAG_RT_PROCESS,
+        sparams, 1);
+
+    pthread_t mth;                          // Mic-Decode-Thread
+    pthread_create(&mth, NULL, mic_thread, &d);
+    pthread_detach(mth);
+
+    fprintf(stderr, "DualSense BT Speaker + Mic als PipeWire-Knoten aktiv. Strg+C beendet.\n");
     pw_main_loop_run(d.loop);
 
+    pw_stream_destroy(d.src_stream);
     pw_stream_destroy(d.stream);
     pw_main_loop_destroy(d.loop);
     opus_encoder_destroy(d.enc);

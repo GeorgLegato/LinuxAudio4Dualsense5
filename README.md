@@ -15,6 +15,11 @@ motors, so the bass you feel in your hands fills in the low end the little
 membrane speaker can't reach. It's on by default and configurable, including a
 small **built-in web UI with a live analyser** at `http://localhost:8118`.
 
+**0.3** adds **Voice-In**: the DualSense's built-in microphone is exposed as a
+recording device **"DualSense BT Mic"**, so any app (Audacity, calls, …) can
+record from the controller over Bluetooth — full duplex alongside playback.
+Off by default (it disturbs the gamepad input — see below).
+
 ```
 PipeWire graph ──PCM──▶ ds5_membrane_sink ──Opus/0x36──▶ DualSense (Bluetooth)
                                    └─ low-pass ─▶ haptics (bass / "subwoofer")
@@ -35,6 +40,7 @@ make it work — none of them documented by Sony:
 | Speaker enable | report `0x31`: `audio_control = 0x30` (speaker path), preamp `0x02` |
 | Config mask | `0x11` byte 4 = **`0xFE`** — bit 0 *cleared*. See "Audio + gamepad" below. |
 | Haptics (subwoofer) | sub-packet `0x12`: **64 × int8 PCM @ 6 kHz** (one packet = one haptic frame). Low-passed bass, see "Rumble as Subwoofer". |
+| Microphone (input) | comes back in the `0x31` input report (marker `0xD4`) as **Opus 48 kHz mono, 10 ms**. Enabled by config mask `0xFF`. See "Microphone / Voice-In". |
 
 Two details matter most:
 
@@ -86,12 +92,13 @@ re-reads the file when its modification time changes). To turn the subwoofer off
 entirely, set `subwoofer = off`:
 
 ```ini
-subwoofer = on        # on | off
-cutoff_hz = 200       # low-pass cutoff in Hz (typ. 120..200)
-gain      = 2.6       # haptic gain (higher = stronger / denser)
-amp       = 64        # int8 amplitude cap, max 127
-web       = on        # web UI / API (localhost only)
-web_port  = 8118
+subwoofer  = on       # on | off
+cutoff_hz  = 200      # low-pass cutoff in Hz (typ. 120..200)
+gain       = 2.6      # haptic gain (higher = stronger / denser)
+amp        = 64       # int8 amplitude cap, max 127
+web        = on       # web UI / API (localhost only)
+web_port   = 8118
+microphone = off      # Voice-In recording device (see "Microphone" below)
 ```
 
 Since it's a systemd user service, a full restart also works if you prefer:
@@ -123,6 +130,23 @@ Open **http://localhost:8118** in any browser while audio plays.
 > line instead, `reverse_engineered/sub_tune.py` is a curses tuner that sweeps
 > cutoff / gain / amp live while music plays (it stops the service while running,
 > then prints the command to start it again).
+
+## Microphone / Voice-In 🎙️
+
+The DualSense has a built-in microphone. Over Bluetooth its audio comes back
+**Opus-encoded inside the HID input report** (48 kHz mono, 10 ms frames). With
+`microphone = on` the service enables that duplex stream, decodes it, and
+publishes a PipeWire **source "DualSense BT Mic"** — so it shows up as a normal
+input device and any app (Audacity, a call, `parecord -d ds5_mic`) can record
+from the controller. Playback and recording run **at the same time** (full
+duplex). Toggle it in the web UI or via `microphone = on/off`.
+
+> ⚠️ **It disturbs the gamepad input.** Sony's mic duplex sends the mic stream
+> under the **same HID report id as gamepad input**, so the kernel/Steam misread
+> it as stick deflection (the same mechanism we avoid for the speaker with mask
+> `0xFE`). That's why it's **off by default** — turn it on only when you actually
+> need the mic, and expect phantom stick input while it's on. (If you find a way
+> to have both cleanly, PRs welcome.)
 
 ## Quick start
 
@@ -199,6 +223,7 @@ reverse_engineered/     the tools that cracked the BT protocol (see its README)
 - ✅ Audio + gamepad work simultaneously (mask `0xFE`)
 - ✅ "Rumble as Subwoofer": low-passed bass on the haptics, live-configurable
 - ✅ Built-in web UI + live analyser at `localhost:8118` (no extra dependency)
+- ✅ Voice-In: microphone as a recording device "DualSense BT Mic" (opt-in, full duplex)
 - ⚠️ A short start-up transient (speaker amp power-on pop) may remain
 
 ## Tested with
