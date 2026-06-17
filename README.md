@@ -116,6 +116,7 @@ amp        = 64       # int8 amplitude cap, max 127
 web        = on       # web UI / API (localhost only)
 web_port   = 8118
 microphone = off      # Voice-In recording device (see "Microphone" below)
+leds       = off      # LED analyser: lightbar colour + player-LED VU (see below)
 ```
 
 Since it's a systemd user service, a full restart also works if you prefer:
@@ -147,6 +148,25 @@ Open **http://localhost:8118** in any browser while audio plays.
 > line instead, `reverse_engineered/sub_tune.py` is a curses tuner that sweeps
 > cutoff / gain / amp live while music plays (it stops the service while running,
 > then prints the command to start it again).
+
+## LED analyser (Amiga-demo style) 🌈
+
+The DualSense's LEDs can dance to the music. With `leds = analyser` (or the
+web-UI toggle) the service turns the controller into a little spectrum display:
+
+- **RGB lightbar** (the strips beside the touchpad) — colour follows the
+  spectrum: **bass → blue, mids → red/warm, highs → white**, brightness = level.
+- **5 white player LEDs** (below the touchpad) — a **VU bar** of the overall level.
+
+It's a single-colour lightbar (one RGB zone, not a per-band rainbow strip), so
+the colour reflects the *balance* of the sound rather than a per-frequency bar —
+but it gives that old-demo vibe. LED control uses a dedicated `0x31` output
+report (sent ~19×/s); turning it off hands the LEDs back to the system. Off by
+default so it doesn't hijack the player indicator unless you want it.
+
+> Reverse-engineered with `reverse_engineered/init_probe.py` — press `l` to take
+> over the LEDs, then edit the `lightbar_R/G/B`, `playerLED` and `led_bright`
+> fields live.
 
 ## Headphone jack output 🎧
 
@@ -290,6 +310,7 @@ reverse_engineered/     the tools that cracked the BT protocol (see its README)
 - ✅ Built-in web UI + live analyser at `localhost:8118` (no extra dependency)
 - ✅ Voice-In: microphone as a recording device "DualSense BT Mic" (opt-in, full duplex)
 - ✅ Output switchable to the 3.5 mm headphone jack (`output = jack`, true stereo)
+- ✅ LED analyser: lightbar colour + player-LED VU follow the music (`leds = analyser`)
 - ⚠️ A short start-up transient (speaker amp power-on pop) may remain
 
 ## Tested with

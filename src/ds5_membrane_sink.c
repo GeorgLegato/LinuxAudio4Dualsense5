@@ -77,6 +77,7 @@ struct subcfg {
     int   web_port;    // default 8118
     int   microphone;  // Voice-In (Mic-Duplex 0xFF) an? default 0 (opt-in)
     int   jack;        // 0 = interner Speaker (0x13), 1 = Kopfhoerer-Klinke (0x16)
+    int   leds;        // LED-Analyser (Lightbar-Farbe + Player-VU) an? default 0
 };
 
 // --- DualSense 0x31/0x36 Konstanten (aus DS5_Bridge bt.cpp/audio.cpp) ----------
@@ -123,6 +124,7 @@ struct data {
     int   ana_bands[NBANDS];          // 0..100 pro Band (Spektrum-Snapshot)
     int   ana_mem, ana_hap;           // 0..100 Pegel Membran / Haptik
     int   ana_mic;                    // 0..100 Pegel Mikrofon
+    int   led_ctr, leds_was;          // LED-Sende-Takt / Zustandswechsel-Erkennung
 
     // Voice-In: hidraw-Reader-Thread -> Opus-Decode -> Ringpuffer -> PW-Source
     struct pw_stream *src_stream;     // "DualSense BT Mic"
@@ -179,6 +181,9 @@ static void load_config(struct data *d) {
             else if (!strcmp(key, "output"))
                 d->cfg.jack = (!strcmp(val, "jack") || !strcmp(val, "klinke") ||
                                !strcmp(val, "headphones") || !strcmp(val, "1"));
+            else if (!strcmp(key, "leds"))
+                d->cfg.leds = (!strcmp(val, "analyser") || !strcmp(val, "analyzer") ||
+                               !strcmp(val, "on") || !strcmp(val, "1"));
         }
     }
     fclose(f);
@@ -210,11 +215,15 @@ static void save_config(struct data *d) {
         "# Voice-In: DS5-Mikrofon als Aufnahmegeraet 'DualSense BT Mic'.\n"
         "# ACHTUNG: aktiviert den Mic-Duplex (Maske 0xFF) -> verseucht den\n"
         "# Gamepad-Input (Phantom-Stick). Nur einschalten, wenn du das Mic brauchst.\n"
-        "microphone = %s\n",
+        "microphone = %s\n"
+        "\n"
+        "# LED-Analyser: Lightbar-Farbe = Spektrum (Bass=Blau, Mitte=Rot, Hoehe=Weiss),\n"
+        "# die 5 Player-LEDs als VU-Balken.\n"
+        "leds      = %s\n",
         d->cfg.web_port, d->cfg.jack ? "jack" : "speaker",
         d->cfg.enabled ? "on" : "off", d->cfg.cutoff,
         d->cfg.gain, d->cfg.amp, d->cfg.web ? "on" : "off", d->cfg.web_port,
-        d->cfg.microphone ? "on" : "off");
+        d->cfg.microphone ? "on" : "off", d->cfg.leds ? "analyser" : "off");
     fclose(f);
     struct stat st;
     if (stat(d->cfg_path, &st) == 0) d->cfg_mtime = st.st_mtime;
@@ -351,6 +360,52 @@ static void analyser_compute(struct data *d, const float *block512,
     pthread_mutex_unlock(&d->lock);
 }
 
+// --- LED-Analyser: Lightbar-Farbe + Player-VU via eigenem 0x31-Report ---------
+// Bass -> Blau, Mitten -> Rot/Warm, Hoehen -> Weiss; Helligkeit = Pegel.
+static void send_led(struct data *d) {
+    int b[NBANDS];
+    pthread_mutex_lock(&d->lock);
+    for (int i = 0; i < NBANDS; i++) b[i] = d->ana_bands[i];
+    pthread_mutex_unlock(&d->lock);
+    int lo = 0, mi = 0, hi = 0;
+    for (int i = 0;  i < 9;      i++) lo += b[i];
+    for (int i = 9;  i < 19;     i++) mi += b[i];
+    for (int i = 19; i < NBANDS; i++) hi += b[i];
+    lo /= 9; mi /= 10; hi /= (NBANDS - 19);                         // ~40-250 / 250-2k / 2k-16k
+    // Farb-Mix (0..100 -> 0..255): Bass=Blau, Mitte=Rot/Warm(R+G), Hoehe=Weiss
+    int r  = (int)((mi * 1.00f + hi * 0.70f) * 2.55f);
+    int g  = (int)((hi * 1.00f + mi * 0.25f) * 2.55f);
+    int bl = (int)((lo * 1.00f + hi * 0.50f) * 2.55f);
+    if (r  > 255) r  = 255;
+    if (g  > 255) g  = 255;
+    if (bl > 255) bl = 255;
+    int lvl = lo > mi ? lo : mi;
+    if (hi > lvl) lvl = hi;                                          // Gesamtpegel
+    static const uint8_t bar[6] = {0x00,0x01,0x03,0x07,0x0F,0x1F};   // VU links->rechts
+    int seg = lvl * 5 / 100;
+    if (seg > 5) seg = 5;
+    if (seg < 0) seg = 0;
+
+    uint8_t p[78]; memset(p, 0, sizeof(p));
+    p[0]=0x31; p[1]=(d->seq<<4)&0xF0; p[2]=0x10;
+    p[4]=0x04|0x10;                          // valid_flag1: Lightbar + Player
+    p[45]=0x02;                              // led_brightness (Player-LEDs)
+    p[46]=bar[seg];                          // player_leds (VU-Balken)
+    p[47]=(uint8_t)r; p[48]=(uint8_t)g; p[49]=(uint8_t)bl;
+    uint32_t crc = ds_crc(p, 74);
+    p[74]=crc&0xFF; p[75]=(crc>>8)&0xFF; p[76]=(crc>>16)&0xFF; p[77]=(crc>>24)&0xFF;
+    if (write(d->hidraw_fd, p, 78) < 0) {}
+}
+
+// LED-Steuerung ans System zurueckgeben (valid_flag1 RELEASE_LEDS = 0x08).
+static void send_led_release(struct data *d) {
+    uint8_t p[78]; memset(p, 0, sizeof(p));
+    p[0]=0x31; p[1]=(d->seq<<4)&0xF0; p[2]=0x10; p[4]=0x08;
+    uint32_t crc = ds_crc(p, 74);
+    p[74]=crc&0xFF; p[75]=(crc>>8)&0xFF; p[76]=(crc>>16)&0xFF; p[77]=(crc>>24)&0xFF;
+    if (write(d->hidraw_fd, p, 78) < 0) {}
+}
+
 // --- 0x36-Paket bauen + senden ------------------------------------------------
 static void send_block(struct data *d, const float *block512) {
     // Web-UI aenderte den Cutoff -> Biquad hier (Audio-Thread) neu rechnen.
@@ -433,8 +488,16 @@ static void send_block(struct data *d, const float *block512) {
     d->seq = (d->seq + 1) & 0x0F;
     d->counter = (d->counter + 1) & 0xFF;
 
-    // Analyser nur rechnen, wenn ein Browser verbunden ist (sonst 0 Overhead).
-    if (d->web_clients > 0) analyser_compute(d, block512, pkt + 78);
+    // Analyser rechnen, wenn ein Browser verbunden ist ODER der LED-Analyser laeuft.
+    if (d->web_clients > 0 || d->cfg.leds) analyser_compute(d, block512, pkt + 78);
+
+    // LED-Analyser: Zustandswechsel -> ggf. LEDs ans System zurueckgeben;
+    // sonst ~19x/s einen 0x31-LED-Report mit der aktuellen Spektral-Farbe.
+    if (d->cfg.leds != d->leds_was) {
+        if (!d->cfg.leds) send_led_release(d);
+        d->leds_was = d->cfg.leds;
+    }
+    if (d->cfg.leds && ++d->led_ctr >= 5) { d->led_ctr = 0; send_led(d); }
 }
 
 // --- 0x31 Speaker-Enable ------------------------------------------------------
@@ -588,6 +651,8 @@ static const char PAGE[] =
 "<div class=row><label>Amp-Cap</label><input type=range id=amp min=1 max=127 step=1><output id=amp_v></output></div>"
 "<div class=row><label>Mikrofon</label><input type=checkbox id=mic><output id=mic_v></output></div>"
 "<div style='font-size:11px;color:#999;margin-top:-4px'>Voice-In als Aufnahmeger&auml;t. Achtung: verseucht den Gamepad-Input.</div>"
+"<div class=row><label>LED-Analyser</label><input type=checkbox id=leds><output id=leds_v></output></div>"
+"<div style='font-size:11px;color:#999;margin-top:-4px'>Lightbar-Farbe = Spektrum (Bass=Blau, Mitte=Rot, H&ouml;he=Wei&szlig;), 5 LEDs = VU.</div>"
 "</div><script>"
 "let ws,bf=null,init=false;"
 "const cv=document.getElementById('cv'),cx=cv.getContext('2d');"
@@ -601,6 +666,8 @@ static const char PAGE[] =
 "document.getElementById('mic_v').textContent=e.target.checked?'an':'aus';send('mic',e.target.checked?1:0);});"
 "document.getElementById('jack').addEventListener('change',e=>{"
 "document.getElementById('jack_v').textContent=e.target.checked?'Klinke':'Membran';send('jack',e.target.checked?1:0);});"
+"document.getElementById('leds').addEventListener('change',e=>{"
+"document.getElementById('leds_v').textContent=e.target.checked?'an':'aus';send('leds',e.target.checked?1:0);});"
 "bind('cut','cut',v=>v+' Hz');bind('gain','gain',v=>(+v).toFixed(1));bind('amp','amp',v=>v);"
 "function draw(b,cut){let W=cv.width,H=cv.height;cx.clearRect(0,0,W,H);if(!bf)return;"
 "let n=b.length,bw=W/n;for(let i=0;i<n;i++){let h=b[i]/100*H;"
@@ -616,6 +683,8 @@ static const char PAGE[] =
 "document.getElementById('mic_v').textContent=m.mic?'an':'aus';"
 "let jk=document.getElementById('jack');jk.checked=!!m.jack;"
 "document.getElementById('jack_v').textContent=m.jack?'Klinke':'Membran';"
+"let ld=document.getElementById('leds');ld.checked=!!m.leds;"
+"document.getElementById('leds_v').textContent=m.leds?'an':'aus';"
 "let c=document.getElementById('cut');c.value=m.cut;document.getElementById('cut_v').textContent=m.cut+' Hz';"
 "let g=document.getElementById('gain');g.value=m.gain;document.getElementById('gain_v').textContent=(+m.gain).toFixed(1);"
 "let a=document.getElementById('amp');a.value=m.amp;document.getElementById('amp_v').textContent=m.amp;}}"
@@ -663,6 +732,8 @@ static void web_apply(struct data *d, const char *payload) {
         d->cfg.microphone = (v != 0);
     } else if (!strcmp(k, "jack")) {
         d->cfg.jack = (v != 0);
+    } else if (!strcmp(k, "leds")) {
+        d->cfg.leds = (v != 0);
     }
     save_config(d);                 // persistieren (+ cfg_mtime, kein Reload-Echo)
     pthread_mutex_unlock(&d->lock);
@@ -797,10 +868,11 @@ static void *web_thread(void *arg) {
             char msg[768]; int o;
             pthread_mutex_lock(&d->lock);
             o = snprintf(msg, sizeof(msg),
-                "{\"on\":%d,\"cut\":%.0f,\"gain\":%.2f,\"amp\":%d,\"mic\":%d,\"jack\":%d,"
+                "{\"on\":%d,\"cut\":%.0f,\"gain\":%.2f,\"amp\":%d,\"mic\":%d,\"jack\":%d,\"leds\":%d,"
                 "\"mem\":%d,\"hap\":%d,\"miclv\":%d,\"b\":[",
                 d->cfg.enabled, d->cfg.cutoff, d->cfg.gain, d->cfg.amp,
-                d->cfg.microphone, d->cfg.jack, d->ana_mem, d->ana_hap, d->ana_mic);
+                d->cfg.microphone, d->cfg.jack, d->cfg.leds,
+                d->ana_mem, d->ana_hap, d->ana_mic);
             for (int bnd = 0; bnd < NBANDS; bnd++)
                 o += snprintf(msg+o, sizeof(msg)-o, "%s%d", bnd?",":"", d->ana_bands[bnd]);
             pthread_mutex_unlock(&d->lock);
