@@ -257,20 +257,36 @@ In 2025 the kernel gained **DualSense audio support — but only over USB**:
   the speaker volume.
 
 That work rides on the **USB audio-class interface**, which the DualSense only
-exposes **over a cable**. So on a recent kernel:
+exposes **over a cable**.
 
-- **USB:** jack detection and speaker routing are handled by the kernel — our
-  optional `make service-usb` path becomes largely **unnecessary** on 6.17+/6.18+.
-- **Bluetooth:** the controller exposes **no USB audio interface**. Its speaker,
-  microphone and haptics live in a proprietary **Opus-in-HID** stream (report
-  `0x36`, mic marker `0xd4`) that **no kernel driver implements**. That is
-  exactly what this project reverse-engineers — and the mainline patches do
-  **not** change anything for the wireless case.
+**Nothing here requires kernel 6.17/6.18 — both of this project's variants run
+on older kernels too:**
 
-So the cabled scenario is moving into the kernel; the **cableless** one — the
-whole point of this project — remains its contribution. (Nice cross-check: the
-kernel's "right channel → mono speaker" mirrors our front-left/front-right
-channel split.)
+- **Bluetooth (the core product):** the controller exposes **no USB audio
+  interface**. Its speaker, microphone and haptics live in a proprietary
+  **Opus-in-HID** stream (report `0x36`, mic marker `0xd4`) that **no kernel
+  driver implements — on any version**. This is exactly what the project
+  reverse-engineers; it needs only PipeWire + `/dev/hidraw` and is independent
+  of the kernel's audio support. The mainline patches change **nothing** for the
+  wireless case.
+- **USB:** over a cable the DualSense has *always* been a generic USB-audio card
+  (long before 6.17). What 6.17/6.18 add is the **automation** — jack detection,
+  routing to the mono speaker, volume. Our `make service-usb` does that same work
+  by hand (HID speaker-enable + PipeWire routing), so it **also needs no special
+  kernel** — it just becomes **redundant** once the kernel does it for you.
+
+So who is this for:
+
+| | Linux **< 6.17** | Linux **≥ 6.17/6.18** |
+|---|---|---|
+| **Bluetooth** | this project ✅ (only option) | this project ✅ (kernel still can't do BT) |
+| **USB / cable** | this project's USB variant ✅ (kernel can't yet) | use the kernel — USB variant redundant |
+
+In short: the **wireless** scenario — the whole point of this project — is its
+lasting contribution on every kernel; the **cabled** scenario is moving into the
+kernel from 6.17 on, but our USB variant still serves anyone on an older one.
+(Nice cross-check: the kernel's "right channel → mono speaker" mirrors our
+front-left/front-right channel split.)
 
 References: [Phoronix — 6.18 jack handling](https://www.phoronix.com/news/Sony-DualSense-Audio-Handling),
 [LWN](https://lwn.net/Articles/1026850/),
