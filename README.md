@@ -200,12 +200,45 @@ make
 
 If you have no Bluetooth or prefer a cable, there's a USB path too — over USB
 the DualSense is a normal 4-channel audio card, it just needs routing + a
-speaker-enable. See [`usb/`](usb/):
+speaker-enable. See [`usb/`](usb/). (On Linux **6.17+/6.18+** the kernel handles
+the USB speaker/jack itself — see the section below — so this path is mostly
+needed only on older kernels.)
 
 ```bash
 pip install --user pydualsense
 cd src && make service-usb
 ```
+
+## Relation to mainline kernel support (USB vs Bluetooth)
+
+In 2025 the kernel gained **DualSense audio support — but only over USB**:
+
+- **Linux 6.17** — `ALSA: usb-audio`: jack detection for the controller's 3.5 mm
+  port (knows when headphones are plugged in).
+- **Linux 6.18** — `HID: playstation` (Cristian Ciocaltea / Collabora): reports
+  headphone/headset-mic insert events via a dedicated input device, **routes
+  audio to the internal mono speaker** (right channel → mono speaker) and bumps
+  the speaker volume.
+
+That work rides on the **USB audio-class interface**, which the DualSense only
+exposes **over a cable**. So on a recent kernel:
+
+- **USB:** jack detection and speaker routing are handled by the kernel — our
+  optional `make service-usb` path becomes largely **unnecessary** on 6.17+/6.18+.
+- **Bluetooth:** the controller exposes **no USB audio interface**. Its speaker,
+  microphone and haptics live in a proprietary **Opus-in-HID** stream (report
+  `0x36`, mic marker `0xd4`) that **no kernel driver implements**. That is
+  exactly what this project reverse-engineers — and the mainline patches do
+  **not** change anything for the wireless case.
+
+So the cabled scenario is moving into the kernel; the **cableless** one — the
+whole point of this project — remains its contribution. (Nice cross-check: the
+kernel's "right channel → mono speaker" mirrors our front-left/front-right
+channel split.)
+
+References: [Phoronix — 6.18 jack handling](https://www.phoronix.com/news/Sony-DualSense-Audio-Handling),
+[LWN](https://lwn.net/Articles/1026850/),
+[ALSA usb-audio patch](https://patchew.org/linux/20250526-dualsense-alsa-jack-v1-0-1a821463b632@collabora.com/).
 
 ## Repository layout
 
