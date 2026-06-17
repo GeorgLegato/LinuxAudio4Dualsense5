@@ -87,6 +87,9 @@ class Probe:
         self.gp = 0; self.d4 = 0                    # shared counters (last 1s)
         self.stop = threading.Event()
         self.seq = 0; self.counter = 0
+        self.route = 0x13                           # 0x13 = interner Speaker, 0x16 = Klinke
+        self.audio_ctl = 0x30                       # Setup-Report b[10]: Routing (0x30=Speaker)
+        self.setup_dirty = False                    # -> Sender schickt build_setup() neu
 
     def build_0x36(self):
         p = bytearray(398)
@@ -96,7 +99,7 @@ class Probe:
         p[10]=self.counter & 0xFF
         p[11]=0x10|0x80; p[12]=63; p[13:13+63]=self.state
         p[76]=0x12|0x80; p[77]=64
-        p[142]=0x13|0x80; p[143]=200
+        p[142]=self.route|0x80; p[143]=200          # 0x13 Speaker / 0x16 Klinke
         op=self.tones[self.ti % len(self.tones)]; self.ti+=1
         p[144:144+len(op)]=op
         c=crc(bytes(p[:394])); struct.pack_into("<I",p,394,c)
@@ -105,7 +108,7 @@ class Probe:
 
     def build_setup(self):
         b=bytearray(78); b[0]=0x31; b[1]=0x10
-        b[3]=0xA0; b[4]=0x80; b[8]=0x64; b[10]=0x30; b[40]=0x02
+        b[3]=0xA0; b[4]=0x80; b[8]=0x64; b[10]=self.audio_ctl; b[40]=0x02
         struct.pack_into("<I",b,74,crc(bytes(b[:74]))); return bytes(b)
 
     def reader(self):
@@ -130,6 +133,10 @@ class Probe:
         os.write(fd, self.build_setup())
         nt=time.monotonic(); per=512/48000.0
         while not self.stop.is_set():
+            if self.setup_dirty:                    # audio_control geaendert -> Setup neu
+                self.setup_dirty=False
+                try: os.write(fd, self.build_setup())
+                except OSError: break
             if self.running:
                 try: os.write(fd, self.build_0x36())
                 except OSError: break
@@ -165,6 +172,9 @@ def main(scr):
         col = curses.A_BOLD | (curses.A_REVERSE if pr.d4==0 and pr.running else 0)
         scr.addstr(3,2,f"EMPFANG:  GAMEPAD={pr.gp:4d}/s    FEEDBACK(d4)={pr.d4:4d}/s",col)
         scr.addstr(4,2,"Ziel: FEEDBACK(d4) = 0  -> kein Audio mehr im Input-Stream",curses.A_DIM)
+        rname = "KLINKE (0x16)" if pr.route==0x16 else "SPEAKER (0x13)"
+        scr.addstr(5,2,f"AUSGABE:  [j] Route = {rname:14s}   [a/d] audio_control = 0x{pr.audio_ctl:02X}",
+                   curses.A_BOLD)
         scr.addstr(6,0,"Config-Bytes  [hoch/runter waehlen, links/rechts +-1, BILD +-0x10]:")
         for i,(label,_,_,dflt) in enumerate(FIELDS):
             v=getval(i); mark="-> " if i==sel else "   "
@@ -172,7 +182,7 @@ def main(scr):
             attr=curses.A_REVERSE if i==sel else 0
             warn="  (0xFF killt BT!)" if (label.startswith("cfg.mask") and v==0xFF) else ""
             scr.addstr(8+i,2,f"{mark}{label:18s} = 0x{v:02X} ({v:3d}){chg}{warn}",attr)
-        scr.addstr(8+len(FIELDS)+1,2,"[r] reset   [SPACE] audio an/aus   [q] quit",curses.A_DIM)
+        scr.addstr(8+len(FIELDS)+1,2,"[j] Speaker/Klinke  [a/d] audio_control -/+  [r] reset  [SPACE] an/aus  [q] quit",curses.A_DIM)
         scr.refresh()
         ch=scr.getch()
         if ch==-1: continue
@@ -184,8 +194,13 @@ def main(scr):
         elif ch==curses.KEY_NPAGE: setval(sel,getval(sel)-0x10)
         elif ch==curses.KEY_PPAGE: setval(sel,getval(sel)+0x10)
         elif ch==ord(' '): pr.running=not pr.running
+        elif ch==ord('j'):                          # Speaker <-> Klinke umschalten
+            pr.route = 0x16 if pr.route==0x13 else 0x13
+        elif ch==ord('a'): pr.audio_ctl=(pr.audio_ctl-1)&0xFF; pr.setup_dirty=True
+        elif ch==ord('d'): pr.audio_ctl=(pr.audio_ctl+1)&0xFF; pr.setup_dirty=True
         elif ch==ord('r'):
             pr.cfg=[0xFE,0,0,0,0,0xFF,0]; pr.state=bytearray(STATE_DEFAULT)
+            pr.route=0x13; pr.audio_ctl=0x30; pr.setup_dirty=True
     pr.stop.set(); time.sleep(0.2)
 
 if __name__=="__main__":

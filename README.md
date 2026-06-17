@@ -108,6 +108,7 @@ re-reads the file when its modification time changes). To turn the subwoofer off
 entirely, set `subwoofer = off`:
 
 ```ini
+output     = speaker  # speaker (internal membrane) | jack (3.5 mm headphone jack)
 subwoofer  = on       # on | off
 cutoff_hz  = 200      # low-pass cutoff in Hz (typ. 120..200)
 gain       = 2.6      # haptic gain (higher = stronger / denser)
@@ -146,6 +147,21 @@ Open **http://localhost:8118** in any browser while audio plays.
 > line instead, `reverse_engineered/sub_tune.py` is a curses tuner that sweeps
 > cutoff / gain / amp live while music plays (it stops the service while running,
 > then prints the command to start it again).
+
+## Headphone jack output 🎧
+
+The DualSense also has a **3.5 mm headphone jack**, and over Bluetooth the same
+Opus stream can be routed there instead of the internal speaker — using sub-packet
+`0x16` (headphone jack) in place of `0x13` (internal speaker). Set `output = jack`
+(or flip the **"Ausgabe"** toggle in the web UI) to send audio to headphones
+plugged into the controller; `output = speaker` (default) uses the membrane.
+
+Unlike the mono membrane, the jack carries **true stereo**: in jack mode the
+sink's left/right channels go to the left/right ear (in speaker mode the left
+channel feeds the mono membrane). The haptic rumble keeps working in both modes.
+
+> Found and dialed in with `reverse_engineered/init_probe.py` (press `j` to flip
+> speaker/jack live, `a`/`d` to sweep the setup `audio_control` byte).
 
 ## Microphone / Voice-In 🎙️
 
@@ -273,6 +289,7 @@ reverse_engineered/     the tools that cracked the BT protocol (see its README)
 - ✅ "Rumble as Subwoofer": low-passed bass on the haptics, live-configurable
 - ✅ Built-in web UI + live analyser at `localhost:8118` (no extra dependency)
 - ✅ Voice-In: microphone as a recording device "DualSense BT Mic" (opt-in, full duplex)
+- ✅ Output switchable to the 3.5 mm headphone jack (`output = jack`, true stereo)
 - ⚠️ A short start-up transient (speaker amp power-on pop) may remain
 
 ## Tested with

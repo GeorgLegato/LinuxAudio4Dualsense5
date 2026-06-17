@@ -76,6 +76,7 @@ struct subcfg {
     int   web;         // Web/API-Dienst an? default 1
     int   web_port;    // default 8118
     int   microphone;  // Voice-In (Mic-Duplex 0xFF) an? default 0 (opt-in)
+    int   jack;        // 0 = interner Speaker (0x13), 1 = Kopfhoerer-Klinke (0x16)
 };
 
 // --- DualSense 0x31/0x36 Konstanten (aus DS5_Bridge bt.cpp/audio.cpp) ----------
@@ -175,6 +176,9 @@ static void load_config(struct data *d) {
             else if (!strcmp(key, "microphone") || !strcmp(key, "mic"))
                 d->cfg.microphone = (!strcmp(val, "on") || !strcmp(val, "1") ||
                                      !strcmp(val, "true") || !strcmp(val, "yes"));
+            else if (!strcmp(key, "output"))
+                d->cfg.jack = (!strcmp(val, "jack") || !strcmp(val, "klinke") ||
+                               !strcmp(val, "headphones") || !strcmp(val, "1"));
         }
     }
     fclose(f);
@@ -190,6 +194,9 @@ static void save_config(struct data *d) {
         "# DualSense BT Speaker — Konfiguration (live nachgeladen, ~1x/s).\n"
         "# Editierbar per Web-UI (http://localhost:%d) oder von Hand.\n"
         "\n"
+        "# Audio-Ausgabe: 'speaker' = interne Membran, 'jack' = Kopfhoerer-Klinke.\n"
+        "output    = %s\n"
+        "\n"
         "# Rumble as Subwoofer: tiefpassgefilterter Bass an die Haptik-Aktuatoren.\n"
         "subwoofer = %s\n"
         "cutoff_hz = %.0f\n"
@@ -204,7 +211,8 @@ static void save_config(struct data *d) {
         "# ACHTUNG: aktiviert den Mic-Duplex (Maske 0xFF) -> verseucht den\n"
         "# Gamepad-Input (Phantom-Stick). Nur einschalten, wenn du das Mic brauchst.\n"
         "microphone = %s\n",
-        d->cfg.web_port, d->cfg.enabled ? "on" : "off", d->cfg.cutoff,
+        d->cfg.web_port, d->cfg.jack ? "jack" : "speaker",
+        d->cfg.enabled ? "on" : "off", d->cfg.cutoff,
         d->cfg.gain, d->cfg.amp, d->cfg.web ? "on" : "off", d->cfg.web_port,
         d->cfg.microphone ? "on" : "off");
     fclose(f);
@@ -369,14 +377,20 @@ static void send_block(struct data *d, const float *block512) {
         int idx = (int)src;
         int nxt = idx < INPUT_BLOCK - 1 ? idx + 1 : idx;
         float frac = (float)(src - idx);
-        float a = block512[idx*SINK_CH + CH_MEMBRANE];   // FL -> Membran
-        float b = block512[nxt*SINK_CH + CH_MEMBRANE];
-        float v = a + (b - a) * frac;
+        float la = block512[idx*SINK_CH + CH_MEMBRANE];  // FL
+        float lb = block512[nxt*SINK_CH + CH_MEMBRANE];
+        float lv = la + (lb - la) * frac;
+        float rv = lv;                                   // Speaker: Mono (R=L)
+        if (d->cfg.jack) {                               // Klinke: echtes Stereo (R=FR)
+            float ra = block512[idx*SINK_CH + CH_HAPTIC];
+            float rb = block512[nxt*SINK_CH + CH_HAPTIC];
+            rv = ra + (rb - ra) * frac;
+        }
         if (d->fade_pos < FADE_SAMPLES) {
             int s = d->fade_pos + i;
-            if (s < FADE_SAMPLES) v *= (float)s / FADE_SAMPLES;
+            if (s < FADE_SAMPLES) { float g=(float)s/FADE_SAMPLES; lv*=g; rv*=g; }
         }
-        out[i*CHANNELS] = out[i*CHANNELS+1] = v;         // Mono-Membran -> Opus L=R
+        out[i*CHANNELS] = lv; out[i*CHANNELS+1] = rv;
     }
     if (d->fade_pos < FADE_SAMPLES) d->fade_pos += OPUS_FRAME;
 
@@ -404,7 +418,8 @@ static void send_block(struct data *d, const float *block512) {
     }
     pkt[76] = 0x12 | 0x80; pkt[77] = HAPTIC_N;
     build_haptic(d, block512, pkt + 78);               // Haptik = Subwoofer-Bass
-    pkt[142] = 0x13 | 0x80; pkt[143] = SPEAKER_BYTES;
+    pkt[142] = (d->cfg.jack ? 0x16 : 0x13) | 0x80;     // 0x13 Speaker / 0x16 Klinke
+    pkt[143] = SPEAKER_BYTES;
     memcpy(pkt + 144, opus, n);                         // Rest ist 0 (CBR=200)
     uint32_t crc = ds_crc(pkt, REPORT_SIZE - 4);
     pkt[394]=crc&0xFF; pkt[395]=(crc>>8)&0xFF; pkt[396]=(crc>>16)&0xFF; pkt[397]=(crc>>24)&0xFF;
@@ -565,6 +580,8 @@ static const char PAGE[] =
 "<div style='font-size:13px;color:#555'>Pegel Membran</div><div class=meter><div id=mm style=background:#3a7ca5></div></div>"
 "<div style='font-size:13px;color:#555'>Pegel Haptik</div><div class=meter><div id=mh style=background:#d98a2b></div></div>"
 "<div style='font-size:13px;color:#555'>Pegel Mikrofon</div><div class=meter><div id=mi style=background:#5a9e5a></div></div>"
+"<div class=row><label>Ausgabe</label><input type=checkbox id=jack><output id=jack_v></output></div>"
+"<div style='font-size:11px;color:#999;margin-top:-4px'>Kopfh&ouml;rer-Klinke (an) statt interner Membran (aus). Klinke = echtes Stereo.</div>"
 "<div class=row><label>Subwoofer</label><input type=checkbox id=on><output id=on_v></output></div>"
 "<div class=row><label>Cutoff</label><input type=range id=cut min=40 max=400 step=5><output id=cut_v></output></div>"
 "<div class=row><label>Gain</label><input type=range id=gain min=0 max=8 step=0.1><output id=gain_v></output></div>"
@@ -582,6 +599,8 @@ static const char PAGE[] =
 "document.getElementById('on_v').textContent=e.target.checked?'an':'aus';send('on',e.target.checked?1:0);});"
 "document.getElementById('mic').addEventListener('change',e=>{"
 "document.getElementById('mic_v').textContent=e.target.checked?'an':'aus';send('mic',e.target.checked?1:0);});"
+"document.getElementById('jack').addEventListener('change',e=>{"
+"document.getElementById('jack_v').textContent=e.target.checked?'Klinke':'Membran';send('jack',e.target.checked?1:0);});"
 "bind('cut','cut',v=>v+' Hz');bind('gain','gain',v=>(+v).toFixed(1));bind('amp','amp',v=>v);"
 "function draw(b,cut){let W=cv.width,H=cv.height;cx.clearRect(0,0,W,H);if(!bf)return;"
 "let n=b.length,bw=W/n;for(let i=0;i<n;i++){let h=b[i]/100*H;"
@@ -595,6 +614,8 @@ static const char PAGE[] =
 "document.getElementById('on_v').textContent=m.on?'an':'aus';"
 "let mc=document.getElementById('mic');mc.checked=!!m.mic;"
 "document.getElementById('mic_v').textContent=m.mic?'an':'aus';"
+"let jk=document.getElementById('jack');jk.checked=!!m.jack;"
+"document.getElementById('jack_v').textContent=m.jack?'Klinke':'Membran';"
 "let c=document.getElementById('cut');c.value=m.cut;document.getElementById('cut_v').textContent=m.cut+' Hz';"
 "let g=document.getElementById('gain');g.value=m.gain;document.getElementById('gain_v').textContent=(+m.gain).toFixed(1);"
 "let a=document.getElementById('amp');a.value=m.amp;document.getElementById('amp_v').textContent=m.amp;}}"
@@ -640,6 +661,8 @@ static void web_apply(struct data *d, const char *payload) {
         d->cfg.enabled = (v != 0);
     } else if (!strcmp(k, "mic")) {
         d->cfg.microphone = (v != 0);
+    } else if (!strcmp(k, "jack")) {
+        d->cfg.jack = (v != 0);
     }
     save_config(d);                 // persistieren (+ cfg_mtime, kein Reload-Echo)
     pthread_mutex_unlock(&d->lock);
@@ -774,10 +797,10 @@ static void *web_thread(void *arg) {
             char msg[768]; int o;
             pthread_mutex_lock(&d->lock);
             o = snprintf(msg, sizeof(msg),
-                "{\"on\":%d,\"cut\":%.0f,\"gain\":%.2f,\"amp\":%d,\"mic\":%d,"
+                "{\"on\":%d,\"cut\":%.0f,\"gain\":%.2f,\"amp\":%d,\"mic\":%d,\"jack\":%d,"
                 "\"mem\":%d,\"hap\":%d,\"miclv\":%d,\"b\":[",
                 d->cfg.enabled, d->cfg.cutoff, d->cfg.gain, d->cfg.amp,
-                d->cfg.microphone, d->ana_mem, d->ana_hap, d->ana_mic);
+                d->cfg.microphone, d->cfg.jack, d->ana_mem, d->ana_hap, d->ana_mic);
             for (int bnd = 0; bnd < NBANDS; bnd++)
                 o += snprintf(msg+o, sizeof(msg)-o, "%s%d", bnd?",":"", d->ana_bands[bnd]);
             pthread_mutex_unlock(&d->lock);
