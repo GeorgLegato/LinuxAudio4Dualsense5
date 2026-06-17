@@ -74,6 +74,12 @@ FIELDS = [
  ("snap.audio_ctl[7]","snap",7,0x09),
  ("snap.mute_led [8]","snap",8,0x00),
  ("snap.pwr_save [9]","snap",9,0x10),
+ # LED-Steuerung (brauchen valid_flag1-Bits 0x04 Lightbar / 0x10 Player -> Taste [l])
+ ("snap.led_bright[42]","snap",42,0x01),
+ ("snap.playerLED [43]","snap",43,0x00),   # Bitmaske der 5 weissen LEDs
+ ("snap.lightbar_R[44]","snap",44,0x00),
+ ("snap.lightbar_G[45]","snap",45,0x00),
+ ("snap.lightbar_B[46]","snap",46,0xff),
 ]
 
 class Probe:
@@ -90,6 +96,7 @@ class Probe:
         self.route = 0x13                           # 0x13 = interner Speaker, 0x16 = Klinke
         self.audio_ctl = 0x30                       # Setup-Report b[10]: Routing (0x30=Speaker)
         self.setup_dirty = False                    # -> Sender schickt build_setup() neu
+        self.led_on = False                         # LED-Steuerung (eigener 0x31-Report)
 
     def build_0x36(self):
         p = bytearray(398)
@@ -111,6 +118,18 @@ class Probe:
         b[3]=0xA0; b[4]=0x80; b[8]=0x64; b[10]=self.audio_ctl; b[40]=0x02
         struct.pack_into("<I",b,74,crc(bytes(b[:74]))); return bytes(b)
 
+    def build_led(self):
+        # Dedizierter 0x31-BT-Output-Report fuer die LEDs (common-Report ab byte 3,
+        # hid-playstation-Layout). valid_flag1: Lightbar(0x04)+Player(0x10).
+        p=bytearray(78); p[0]=0x31; p[1]=(self.seq<<4)&0xF0; p[2]=0x10
+        p[4]=0x04|0x10                 # common.valid_flag1
+        p[45]=self.state[42]           # common.led_brightness
+        p[46]=self.state[43]           # common.player_leds (5-Bit-Maske)
+        p[47]=self.state[44]           # common.lightbar_red
+        p[48]=self.state[45]           # common.lightbar_green
+        p[49]=self.state[46]           # common.lightbar_blue
+        struct.pack_into("<I",p,74,crc(bytes(p[:74]))); return bytes(p)
+
     def reader(self):
         try: fd=os.open(self.path, os.O_RDONLY|os.O_NONBLOCK)
         except OSError: return
@@ -131,11 +150,15 @@ class Probe:
         try: fd=os.open(self.path, os.O_WRONLY)
         except OSError: return
         os.write(fd, self.build_setup())
-        nt=time.monotonic(); per=512/48000.0
+        nt=time.monotonic(); per=512/48000.0; led_t=0.0
         while not self.stop.is_set():
             if self.setup_dirty:                    # audio_control geaendert -> Setup neu
                 self.setup_dirty=False
                 try: os.write(fd, self.build_setup())
+                except OSError: break
+            if self.led_on and time.monotonic()-led_t > 0.20:   # LED ~5x/s re-assert
+                led_t=time.monotonic()
+                try: os.write(fd, self.build_led())
                 except OSError: break
             if self.running:
                 try: os.write(fd, self.build_0x36())
@@ -165,24 +188,33 @@ def main(scr):
         _,kind,idx,_=FIELDS[i]; v&=0xFF
         if kind=="cfg": pr.cfg[idx]=v
         else: pr.state[idx]=v
+    def put(y,x,s,attr=0):                           # randsicheres addstr
+        maxy,maxx=scr.getmaxyx()
+        if y>=maxy or x>=maxx: return
+        try: scr.addstr(y,x,s[:maxx-x-1],attr)
+        except curses.error: pass
     while True:
         scr.erase()
-        scr.addstr(0,0,"DualSense Audio-Init-Sondierer  (Root-Cause d4-Stream)",curses.A_BOLD)
-        scr.addstr(1,0,f"hidraw {pr.path}   Audio: {'AN ' if pr.running else 'aus'} [SPACE]")
+        put(0,0,"DualSense Audio-Init-Sondierer  (Root-Cause d4-Stream)",curses.A_BOLD)
+        put(1,0,f"hidraw {pr.path}   Audio: {'AN ' if pr.running else 'aus'} [SPACE]")
+        put(2,2,f"LEDs: [l] {'AN ' if pr.led_on else 'aus'}  Lightbar #"
+                f"{pr.state[44]:02X}{pr.state[45]:02X}{pr.state[46]:02X}  "
+                f"Player=0b{pr.state[43]&0x1f:05b}  bright={pr.state[42]}",
+                curses.A_BOLD if pr.led_on else curses.A_DIM)
         col = curses.A_BOLD | (curses.A_REVERSE if pr.d4==0 and pr.running else 0)
-        scr.addstr(3,2,f"EMPFANG:  GAMEPAD={pr.gp:4d}/s    FEEDBACK(d4)={pr.d4:4d}/s",col)
-        scr.addstr(4,2,"Ziel: FEEDBACK(d4) = 0  -> kein Audio mehr im Input-Stream",curses.A_DIM)
+        put(3,2,f"EMPFANG:  GAMEPAD={pr.gp:4d}/s    FEEDBACK(d4)={pr.d4:4d}/s",col)
+        put(4,2,"Ziel: FEEDBACK(d4) = 0  -> kein Audio mehr im Input-Stream",curses.A_DIM)
         rname = "KLINKE (0x16)" if pr.route==0x16 else "SPEAKER (0x13)"
-        scr.addstr(5,2,f"AUSGABE:  [j] Route = {rname:14s}   [a/d] audio_control = 0x{pr.audio_ctl:02X}",
-                   curses.A_BOLD)
-        scr.addstr(6,0,"Config-Bytes  [hoch/runter waehlen, links/rechts +-1, BILD +-0x10]:")
+        put(5,2,f"AUSGABE:  [j] Route = {rname:14s}   [a/d] audio_control = 0x{pr.audio_ctl:02X}",
+            curses.A_BOLD)
+        put(6,0,"Config-Bytes  [hoch/runter waehlen, links/rechts +-1, BILD +-0x10]:")
         for i,(label,_,_,dflt) in enumerate(FIELDS):
             v=getval(i); mark="-> " if i==sel else "   "
             chg="" if v==dflt else "  *"
             attr=curses.A_REVERSE if i==sel else 0
             warn="  (0xFF killt BT!)" if (label.startswith("cfg.mask") and v==0xFF) else ""
-            scr.addstr(8+i,2,f"{mark}{label:18s} = 0x{v:02X} ({v:3d}){chg}{warn}",attr)
-        scr.addstr(8+len(FIELDS)+1,2,"[j] Speaker/Klinke  [a/d] audio_control -/+  [r] reset  [SPACE] an/aus  [q] quit",curses.A_DIM)
+            put(7+i,2,f"{mark}{label:18s} = 0x{v:02X} ({v:3d}){chg}{warn}",attr)
+        put(7+len(FIELDS)+1,2,"[j]Speaker/Klinke [a/d]audio_ctl [l]LEDs [r]reset [SPACE]an/aus [q]quit",curses.A_DIM)
         scr.refresh()
         ch=scr.getch()
         if ch==-1: continue
@@ -198,6 +230,10 @@ def main(scr):
             pr.route = 0x16 if pr.route==0x13 else 0x13
         elif ch==ord('a'): pr.audio_ctl=(pr.audio_ctl-1)&0xFF; pr.setup_dirty=True
         elif ch==ord('d'): pr.audio_ctl=(pr.audio_ctl+1)&0xFF; pr.setup_dirty=True
+        elif ch==ord('l'):                          # LED-Steuerung an/aus (0x31-Report)
+            pr.led_on = not pr.led_on
+            if pr.led_on and pr.state[44]==0 and pr.state[45]==0 and pr.state[46]==0:
+                pr.state[46]=0xff                   # Default: blau, damit man sofort was sieht
         elif ch==ord('r'):
             pr.cfg=[0xFE,0,0,0,0,0xFF,0]; pr.state=bytearray(STATE_DEFAULT)
             pr.route=0x13; pr.audio_ctl=0x30; pr.setup_dirty=True
