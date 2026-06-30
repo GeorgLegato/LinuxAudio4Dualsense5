@@ -45,6 +45,15 @@ def opus_tone(freq=440, nframes=400):   # langer Loop -> seltener Opus-State-Kna
 
 def crc(d): return zlib.crc32(bytes([0xA2])+d) & 0xFFFFFFFF
 
+def feedback_params(start, strength):   # Adaptive-Trigger FEEDBACK (Widerstand)
+    fv = (max(1, min(8, strength)) - 1) & 0x07     # Kraft 1..8 -> 3-Bit-Wert
+    active = force = 0
+    for z in range(start, 10):                     # Zonen ab 'start' aktiv
+        active |= (1 << z); force |= (fv << (3 * z))
+    return [active & 0xff, (active >> 8) & 0xff,
+            force & 0xff, (force >> 8) & 0xff, (force >> 16) & 0xff, (force >> 24) & 0xff,
+            0, 0, 0, 0]
+
 def find_hidraw():
     for d in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
         try:
@@ -97,6 +106,8 @@ class Probe:
         self.audio_ctl = 0x30                       # Setup-Report b[10]: Routing (0x30=Speaker)
         self.setup_dirty = False                    # -> Sender schickt build_setup() neu
         self.led_on = False                         # LED-Steuerung (eigener 0x31-Report)
+        self.trig_on = False                        # Adaptive Trigger (Widerstand L2+R2)
+        self.trig_str = 6                           # Trigger-Staerke 1..8
 
     def build_0x36(self):
         p = bytearray(398)
@@ -118,16 +129,22 @@ class Probe:
         b[3]=0xA0; b[4]=0x80; b[8]=0x64; b[10]=self.audio_ctl; b[40]=0x02
         struct.pack_into("<I",b,74,crc(bytes(b[:74]))); return bytes(b)
 
-    def build_led(self):
-        # Dedizierter 0x31-BT-Output-Report fuer die LEDs (common-Report ab byte 3,
-        # hid-playstation-Layout). valid_flag1: Lightbar(0x04)+Player(0x10).
+    def build_out(self):
+        # Ein 0x31-Output-Report: LEDs (valid_flag1) + Adaptive Trigger (valid_flag0).
         p=bytearray(78); p[0]=0x31; p[1]=(self.seq<<4)&0xF0; p[2]=0x10
-        p[4]=0x04|0x10                 # common.valid_flag1
-        p[45]=self.state[42]           # common.led_brightness
-        p[46]=self.state[43]           # common.player_leds (5-Bit-Maske)
-        p[47]=self.state[44]           # common.lightbar_red
-        p[48]=self.state[45]           # common.lightbar_green
-        p[49]=self.state[46]           # common.lightbar_blue
+        if self.led_on:
+            p[4]=0x04|0x10                          # valid_flag1: Lightbar + Player
+            p[45]=self.state[42]; p[46]=self.state[43]
+            p[47]=self.state[44]; p[48]=self.state[45]; p[49]=self.state[46]
+        p[3]=0x04|0x08                              # valid_flag0: rechter+linker Trigger
+        if self.trig_on:                            # FEEDBACK-Widerstand ab Zone 2
+            pr=feedback_params(2, self.trig_str)
+            p[13]=0x21
+            for i in range(10): p[14+i]=pr[i]       # rechter Trigger (R2)
+            p[24]=0x21
+            for i in range(10): p[25+i]=pr[i]       # linker Trigger (L2)
+        else:
+            p[13]=0x05; p[24]=0x05                  # OFF -> Trigger frei
         struct.pack_into("<I",p,74,crc(bytes(p[:74]))); return bytes(p)
 
     def reader(self):
@@ -156,9 +173,9 @@ class Probe:
                 self.setup_dirty=False
                 try: os.write(fd, self.build_setup())
                 except OSError: break
-            if self.led_on and time.monotonic()-led_t > 0.20:   # LED ~5x/s re-assert
+            if time.monotonic()-led_t > 0.20:        # LED+Trigger ~5x/s re-assert
                 led_t=time.monotonic()
-                try: os.write(fd, self.build_led())
+                try: os.write(fd, self.build_out())
                 except OSError: break
             if self.running:
                 try: os.write(fd, self.build_0x36())
@@ -205,7 +222,8 @@ def main(scr):
         put(3,2,f"EMPFANG:  GAMEPAD={pr.gp:4d}/s    FEEDBACK(d4)={pr.d4:4d}/s",col)
         put(4,2,"Ziel: FEEDBACK(d4) = 0  -> kein Audio mehr im Input-Stream",curses.A_DIM)
         rname = "KLINKE (0x16)" if pr.route==0x16 else "SPEAKER (0x13)"
-        put(5,2,f"AUSGABE:  [j] Route = {rname:14s}   [a/d] audio_control = 0x{pr.audio_ctl:02X}",
+        put(5,2,f"AUSGABE: [j]Route={rname:13s} [a/d]audio=0x{pr.audio_ctl:02X}   "
+                f"TRIGGER: [t]{'AN ' if pr.trig_on else 'aus'} [f/g]Kraft={pr.trig_str}",
             curses.A_BOLD)
         put(6,0,"Config-Bytes  [hoch/runter waehlen, links/rechts +-1, BILD +-0x10]:")
         for i,(label,_,_,dflt) in enumerate(FIELDS):
@@ -214,7 +232,7 @@ def main(scr):
             attr=curses.A_REVERSE if i==sel else 0
             warn="  (0xFF killt BT!)" if (label.startswith("cfg.mask") and v==0xFF) else ""
             put(7+i,2,f"{mark}{label:18s} = 0x{v:02X} ({v:3d}){chg}{warn}",attr)
-        put(7+len(FIELDS)+1,2,"[j]Speaker/Klinke [a/d]audio_ctl [l]LEDs [r]reset [SPACE]an/aus [q]quit",curses.A_DIM)
+        put(7+len(FIELDS)+1,2,"[j]Spk/Klinke [a/d]audio [l]LEDs [t]Trigger [f/g]Kraft [r]reset [SPACE]aud [q]quit",curses.A_DIM)
         scr.refresh()
         ch=scr.getch()
         if ch==-1: continue
@@ -234,9 +252,13 @@ def main(scr):
             pr.led_on = not pr.led_on
             if pr.led_on and pr.state[44]==0 and pr.state[45]==0 and pr.state[46]==0:
                 pr.state[46]=0xff                   # Default: blau, damit man sofort was sieht
+        elif ch==ord('t'): pr.trig_on = not pr.trig_on        # Adaptive Trigger an/aus
+        elif ch==ord('f'): pr.trig_str = max(1, pr.trig_str-1)
+        elif ch==ord('g'): pr.trig_str = min(8, pr.trig_str+1)
         elif ch==ord('r'):
             pr.cfg=[0xFE,0,0,0,0,0xFF,0]; pr.state=bytearray(STATE_DEFAULT)
             pr.route=0x13; pr.audio_ctl=0x30; pr.setup_dirty=True
+            pr.led_on=False; pr.trig_on=False; pr.trig_str=6
     pr.stop.set(); time.sleep(0.2)
 
 if __name__=="__main__":
