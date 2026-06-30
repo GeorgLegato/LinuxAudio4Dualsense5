@@ -349,6 +349,9 @@ usb/                    wired variant (4ch USB-audio card + HID enable)
   ds5_usb_enable.py     HID speaker-enable keep-alive (needs pydualsense)
 mapper/                 optional Steam-free gamepad mapper
   ds5_keymap.py         stick -> WASD straight from hidraw, drops 0xd4 frames
+games/                  DualSense-only games (LEDs/sound/rumble) — see its README
+handheld/               stream-to-phone setup (Sunshine host for Moonlight)
+  setup-moonlight.sh    `make moonlight` installs Sunshine + prints the steps
 reverse_engineered/     the tools that cracked the BT protocol (see its README)
   ps5bt_membrane.py     Python reference implementation of the speaker path
   ps5bt_speaker.py      the earlier haptics-path experiments
@@ -371,6 +374,7 @@ reverse_engineered/     the tools that cracked the BT protocol (see its README)
 - ✅ Voice-In: microphone as a recording device "DualSense BT Mic" (opt-in, full duplex)
 - ✅ Output switchable to the 3.5 mm headphone jack (`output = jack`, true stereo)
 - ✅ LED analyser: lightbar colour + player-LED VU follow the music (`leds = analyser`)
+- ✅ Handheld mode: stream the game to a phone (Moonlight), sound/input on the DualSense — [`handheld/`](handheld/)
 - ⚠️ A short start-up transient (speaker amp power-on pop) may remain
 
 ## Tested with

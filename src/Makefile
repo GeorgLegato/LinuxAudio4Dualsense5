@@ -83,4 +83,9 @@ service-usb-uninstall:
 	systemctl --user daemon-reload
 	@echo "USB service removed."
 
-.PHONY: clean install release service service-uninstall service-usb service-usb-uninstall
+# --- Handheld mode: stream the game to a phone (Sunshine host for Moonlight) --
+# Video -> phone, sound/input/rumble/LEDs -> DualSense. See ../handheld/README.md
+moonlight:
+	../handheld/setup-moonlight.sh
+
+.PHONY: clean install release moonlight service service-uninstall service-usb service-usb-uninstall
