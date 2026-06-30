@@ -41,6 +41,28 @@ Then, as the script explains:
 Wi-Fi (5 GHz) is plenty; for a wired, no-Wi-Fi link you can use the phone's
 USB tethering and point Moonlight at the PC's address on that interface.
 
+## Troubleshooting (from a real test run)
+
+- **Phone can't find / reach the PC?**
+  - **On a VPN?** This is the usual culprit. A VPN kill-switch blocks your local
+    network, so the phone can't reach the PC. Allow LAN: on **Mullvad**
+    `mullvad lan set allow`; other clients have a *"Local network sharing /
+    allow LAN"* toggle. (The PC routing the internet through the VPN is fine —
+    phone↔PC traffic stays on the local subnet.)
+  - **Add the host by IP** instead of relying on auto-discovery: in Moonlight tap
+    *Add Host* and enter the PC's LAN address. Find it with:
+    ```bash
+    ip -4 addr show | grep -oP '192\.168\.[0-9.]+' | head -1   # or: hostname -I
+    ```
+  - PC on an **Ethernet cable** + phone on **Wi-Fi** is fine *as long as both
+    hang off the same router* (same subnet, e.g. `192.168.178.x` on a Fritz!Box).
+
+- **Stream stutters?** Lower the bitrate / resolution in the Sunshine web UI and
+  prefer **5 GHz** Wi-Fi. With a hardware encoder (NVENC/VAAPI) latency is low.
+
+> Verified end-to-end: streamed to an iPhone (Moonlight) with NVENC encoding,
+> while input + audio (incl. subwoofer / headphone jack) stayed on the DualSense.
+
 ## Notes
 
 - Sunshine is a separate project (GPLv3); `make moonlight` just installs the
