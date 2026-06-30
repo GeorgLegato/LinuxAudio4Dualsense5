@@ -948,9 +948,16 @@ static void on_process_src(void *userdata) {
     float *dst = buf->datas[0].data;
     if (dst) {
         uint32_t maxf = buf->datas[0].maxsize / sizeof(float);
-        // Quantum: was der Graph anfordert; Fallback 512 (Source node.latency).
+        // Quantum: was der Graph anfordert. b->requested gibt's erst ab PipeWire
+        // 0.3.49; aeltere (z.B. Ubuntu 22.04 fuer den prebuilt Release) haben es
+        // nicht -> maxf, das durch node.latency "512/48000" begrenzt ist.
+#if defined(PW_CHECK_VERSION) && PW_CHECK_VERSION(0, 3, 49)
         uint32_t req = (b->requested && (uint32_t)b->requested <= maxf)
-                       ? (uint32_t)b->requested : (maxf < 512 ? maxf : 512);
+                       ? (uint32_t)b->requested : maxf;
+#else
+        uint32_t req = maxf;
+#endif
+        if (req > 1024) req = 1024;             // Sicherheits-Cap gegen Ring-Leerung
         pthread_mutex_lock(&d->mic_lock);
         uint32_t avail = (uint32_t)((d->mic_w - d->mic_r + MIC_RING_FRAMES) % MIC_RING_FRAMES);
         if (!d->mic_ready && avail >= MIC_PREBUF) d->mic_ready = 1;  // Polster voll -> los
