@@ -11,11 +11,33 @@ LDLIBS   = $(shell pkg-config --libs $(PKGS)) -lm -pthread
 
 TARGET   = ds5_membrane_sink
 
+VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
+ARCH    := $(shell uname -m)
+RELNAME  = ds5-bt-audio-$(VERSION)-$(ARCH)
+DISTDIR  = ../dist
+STAGE    = $(DISTDIR)/$(RELNAME)
+
 $(TARGET): ds5_membrane_sink.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 clean:
 	rm -f $(TARGET)
+	rm -rf $(DISTDIR)
+
+# Prebuilt release tarball: binary + service + install.sh, no compiler needed on
+# the target (works on immutable distros like SteamOS — installs into ~/.local).
+release: $(TARGET)
+	rm -rf $(STAGE)
+	mkdir -p $(STAGE)/usb
+	cp $(TARGET) ds5-membrane-sink.service $(STAGE)/
+	cp ../packaging/install.sh ../packaging/uninstall.sh $(STAGE)/
+	-cp ../usb/* $(STAGE)/usb/ 2>/dev/null
+	cp ../README.md $(STAGE)/
+	chmod +x $(STAGE)/install.sh $(STAGE)/uninstall.sh
+	tar -C $(DISTDIR) -czf $(DISTDIR)/$(RELNAME).tar.gz $(RELNAME)
+	@echo ""
+	@echo "Built $(DISTDIR)/$(RELNAME).tar.gz"
+	@echo "Target install:  tar xzf $(RELNAME).tar.gz && cd $(RELNAME) && ./install.sh"
 
 # In den eigenen ~/.local/bin installieren (kein root noetig)
 install: $(TARGET)
@@ -61,4 +83,4 @@ service-usb-uninstall:
 	systemctl --user daemon-reload
 	@echo "USB service removed."
 
-.PHONY: clean install service service-uninstall service-usb service-usb-uninstall
+.PHONY: clean install release service service-uninstall service-usb service-usb-uninstall

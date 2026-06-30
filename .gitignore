@@ -14,3 +14,6 @@ btmon*.txt
 # Editor
 *.swp
 .vscode/
+
+# Release artifacts
+/dist/

@@ -208,6 +208,23 @@ cd src
 make service
 ```
 
+### Prebuilt install — SteamOS / Steam Deck (no compiler)
+
+On immutable distros like **SteamOS** you can't easily install dev packages or
+compile, so grab a **prebuilt release** instead — it installs entirely into your
+`~/.local` (which survives OS updates), no root, no `make`, no pacman:
+
+```bash
+# download the latest ds5-bt-audio-*-x86_64.tar.gz from the Releases page, then:
+tar xzf ds5-bt-audio-*-x86_64.tar.gz
+cd ds5-bt-audio-*-x86_64
+./install.sh          # -> ~/.local/bin + a systemd --user service
+```
+
+The release tarball is produced by `make release` (and by CI on every tag —
+built on an older glibc so it runs on SteamOS and newer alike). It needs only
+PipeWire + Opus at runtime, which SteamOS already has. Uninstall: `./uninstall.sh`.
+
 That's it. `make service` builds the sink, installs it to `~/.local/bin`, and
 enables a **systemd user service** that auto-starts. Pair your DualSense over
 Bluetooth (it appears as a gamepad) and **"DualSense BT Speaker"** shows up in

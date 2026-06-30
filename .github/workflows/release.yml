@@ -1,0 +1,47 @@
+name: release
+
+# Build a prebuilt binary tarball and attach it to the GitHub Release.
+# Runs on ubuntu-22.04 on purpose: its older glibc/PipeWire produce a binary
+# that also runs on newer systems (forward-compatible) — including SteamOS,
+# whose immutable root makes compiling on-device impractical.
+
+on:
+  push:
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # so `git describe` sees the tag
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libopus-dev zlib1g-dev gcc make
+
+      - name: Build release tarball
+        run: make -C src release
+
+      - name: Show artifact
+        run: ls -l dist && tar tzf dist/*.tar.gz | head
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
+
+      - name: Upload as workflow artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ds5-bt-audio-prebuilt
+          path: dist/*.tar.gz
