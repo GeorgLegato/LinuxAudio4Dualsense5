@@ -3,6 +3,33 @@
 **Use the PlayStation 5 DualSense controller's built-in speaker as a regular
 audio output device over Bluetooth — on Linux, with no cable.**
 
+## TL;DR — Steam Deck / SteamOS 🎮
+
+Play game audio (and music) through your DualSense's **speaker or its headphone
+jack — wirelessly**. No cable, no compiling.
+
+1. **Download** the latest `ds5-bt-audio-*-x86_64.tar.gz` from the
+   [**Releases**](https://github.com/GeorgLegato/LinuxAudio4Dualsense5/releases) page.
+2. On the Deck, switch to **Desktop Mode**, open a terminal (Konsole), then:
+   ```bash
+   tar xzf ~/Downloads/ds5-bt-audio-*-x86_64.tar.gz
+   cd ds5-bt-audio-*-x86_64
+   ./install.sh
+   ```
+3. Pair your DualSense over **Bluetooth**, then pick **"DualSense BT Speaker"** as
+   the audio output. Plug headphones into the controller? Toggle **Output → jack**
+   in the web UI at **http://localhost:8118**. Done — it auto-starts from now on.
+
+**After a SteamOS update?** → **Nothing to do.** It installs into your home
+(`~/.local`), which SteamOS keeps across updates, so it just keeps working. Only
+if a *future* SteamOS ever changes PipeWire so much that it breaks, grab the
+newest release and run `./install.sh` again. Uninstall anytime: `./uninstall.sh`.
+
+> Verified: the prebuilt binary loads cleanly against a current SteamOS image
+> (glibc 2.41, PipeWire/Opus present). No root, no `pacman`, no dev packages.
+
+---
+
 Sony's official position is that the DualSense speaker only works over USB.
 Over Bluetooth the controller speaks a proprietary, undocumented audio protocol
 that no mainstream Linux tool implements. This project does: it registers a
